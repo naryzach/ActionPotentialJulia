@@ -1,0 +1,375 @@
+---
+title: "Action Potential Model Analysis Report"
+author: "Ryan Gustafson"
+date: "September 7, 2025"
+---
+
+# Introduction
+This report details the fitting of a Hodgkin-Huxley-style action potential model to experimental electrophysiology data.  
+The analysis was performed using Julia.  
+
+This document presents the results from two main workflows:
+1. Fitting individual *Thamnophis* muscle traces  
+2. A comprehensive group analysis comparing different experimental conditions  
+
+---
+
+# Setup Cell: Load packages and helper modules
+```julia; echo=false
+# Setup and Data Loading
+# This cell loads all necessary packages, helper files, and the main dataset.
+
+using Dates, Printf, DataFrames, CSV, Plots, StatsPlots, MixedModels, CategoricalArrays, LaTeXStrings, Statistics, Markdown, Images
+using FileIO, PNGFiles
+
+cd(@__DIR__) # Ensure we're in the script directory
+
+include("config.jl")
+include("ActionPotential.jl")
+include("action_potential_plots.jl") # Using your new filename
+using .ActionPotentialModel
+using .ActionPotentialPlots
+
+# Create a directory for new images if it doesn't exist
+const images_dir = joinpath(pwd(), "report_images")
+mkpath(images_dir)
+
+# Define the path to the group analysis results
+group_data_path = joinpath(output_folder, "Group_Trace", "latest", "All_sim_data.csv")
+species = "Atratus"
+group_names_for_report = ["WT", "P", "EPN"]
+trace_files = ["$(species)_WT.csv", "$(species)_P.csv", "$(species)_EPN.csv"]
+
+# Load the main dataset and prepare it for analysis
+sim_data = if isfile(group_data_path)
+    println("Loading group analysis data from: ", group_data_path)
+    df = CSV.read(group_data_path, DataFrame)
+    
+    # Ensure string group names are assigned for plotting
+    if !("group" in names(df)) && ("group_id" in names(df))
+        df.group = [group_names_for_report[id] for id in df.group_id]
+    end
+    df; # return the loaded and processed dataframe
+else
+    println("WARNING: Group analysis data not found at '$(group_data_path)'. Please run the 'group' workflow first.")
+    nothing # return nothing if the file is not found
+end
+```
+
+---
+
+# Model Kinetics
+The fundamental behavior of the model is determined by the voltage-dependent kinetics of the ion channel subunits (*m, h,* and *n*).  
+
+The plots below visualize the steady-state activation/inactivation probabilities (`m_infty, h_infty, n_infty`)  
+and their corresponding time constants (`tau_m, tau_h, tau_n`) as a function of membrane potential.  
+
+## Steady-state Kinetics
+
+These curves are generated using the average fitted parameters for the WT group.
+
+```julia; echo=false
+# Generate plots for subunit kinetics
+if sim_data !== nothing
+    # Calculate average parameters
+    avg_params_by_group = combine(groupby(sim_data, :group), names(sim_data, Real) .=> mean)
+
+    for group_name in group_names_for_report
+        avg_params_df = filter(row -> row.group == group_name, avg_params_by_group)
+
+        #display(Markdown.MD(Markdown.parse("### Steady-state Kinetics for Group: `$group_name`\n")))
+        
+        if !isempty(avg_params_df)
+            calculated_means = NamedTuple(avg_params_df[1, :])
+            full_avg_params = merge(par_0, calculated_means)
+            
+            kinetics_fig = ActionPotentialPlots.plot_subunit_kinetics(full_avg_params, "$(group_name) Average")
+            kinetics_path = joinpath(images_dir, "subunit_kinetics.png")
+            savefig(kinetics_fig, kinetics_path)
+
+            display(kinetics_fig)
+        else
+            println("*Could not find $(group_name) group data to generate kinetics plot.*")
+        end
+    end
+else
+    println("*Group analysis data is missing, skipping kinetics plot.*")
+end
+```
+
+## Decomposition Plots
+
+These continured plots give current and conductance decomposition
+
+```julia; echo=false
+# Generate plots for decomposition plots
+if sim_data !== nothing
+    # Calculate average parameters
+    avg_params_by_group = combine(groupby(sim_data, :group), names(sim_data, Real) .=> mean)
+
+    for group_name in group_names_for_report
+
+        wt_avg_params_df = filter(row -> row.group == group_name, avg_params_by_group)
+
+        file_path = joinpath(data_folder, "$(species)_$(group_name).csv")
+        df_raw = CSV.read(file_path, DataFrame; header=4)
+        trace = collect(skipmissing(df_raw[:, 2]))
+        time = collect(skipmissing(df_raw[:, 1]))
+        
+        if !isempty(wt_avg_params_df)
+            #display(Markdown.MD(Markdown.parse("### Current Decomposition for Group: `$group_name`\n")))
+            
+            calculated_means = NamedTuple(wt_avg_params_df[1, :])
+            full_avg_params = merge(par_0, calculated_means)
+
+            ap = ActionPotentialModel.ActionPotential(full_avg_params, trace, time)
+            
+            currents_fig = ActionPotentialPlots.plot_currents(ap, group_name)
+            currents_path = joinpath(images_dir, "$(group_name)_current_decomposition.png")
+            savefig(currents_fig, currents_path)
+
+            display(currents_fig)
+
+            #display(Markdown.MD(Markdown.parse("### Conductance Decomposition for Group: `$group_name`\n")))
+
+            conductances_fig = ActionPotentialPlots.plot_conductances(ap, group_name)
+            conductances_path = joinpath(images_dir, "$(group_name)_conductance_decomposition.png")
+            savefig(conductances_fig, conductances_path)
+
+            display(conductances_fig)
+        else
+            println("*Could not find $(group_name) group data to generate decomposition plots.*")
+        end 
+    end
+else
+    println("*Group analysis data is missing, skipping decomposition plot.*")
+end
+```
+
+## Alpha and Beta Rate Functions
+
+And these plots give the alpha an beta rate functions.
+
+```julia; echo=false
+# Generate plots for alpha and beta
+if sim_data !== nothing
+    # Calculate average parameters
+    avg_params_by_group = combine(groupby(sim_data, :group), names(sim_data, Real) .=> mean)
+
+    for group_name in group_names_for_report
+        avg_params_df = filter(row -> row.group == group_name, avg_params_by_group)
+
+        #display(Markdown.MD(Markdown.parse("### Alpha and Beta Rate Functions for Group: `$group_name`\n")))
+        
+        if !isempty(avg_params_df)
+            calculated_means = NamedTuple(avg_params_df[1, :])
+            full_avg_params = merge(par_0, calculated_means)
+
+            alpha_beta_fig = ActionPotentialPlots.plot_alpha_beta(full_avg_params, group_name)
+            alpha_beta_path = joinpath(images_dir, "$(group_name)_alpha_beta_rate_functions.png")
+            savefig(alpha_beta_fig, alpha_beta_path)
+
+            display(alpha_beta_fig)
+        else
+            println("*Could not find $(group_name) group data to generate decomposition plots.*")
+        end
+    end
+else
+    println("*Group analysis data is missing, skipping decomposition plot.*")
+end
+```
+
+
+---
+# Raw Experimental Traces
+Before fitting the model, it is instructive to visualize the raw experimental data. The plots below show all recorded action potential traces for each experimental group, overlaid to show the degree of variation.
+
+```julia; echo=false
+println("Generating raw trace plots...")
+for (group_name, file) in zip(group_names_for_report, trace_files)
+    
+    #display(Markdown.MD(Markdown.parse("## Group: `$group_name`\n")))
+    
+    filepath = joinpath(data_folder, file)
+    if isfile(filepath)
+        df_raw = CSV.read(filepath, DataFrame; header=4, missingstring="")
+        raw_plot = ActionPotentialPlots.plot_raw_traces(df_raw, group_name)
+        savefig(raw_plot, joinpath(images_dir, "raw_traces_$(group_name).png"))
+        display(raw_plot)
+    else
+        println("*Data file not found for group $(group_name): $(filepath)*")
+    end
+end
+```
+---
+
+# Individual Trace Analysis
+The model was first fitted to individual action potential traces from each experimental group.  
+
+The plots below show the final fitted model trace (blue) overlaid on the experimental data (red) for each recording.  
+The stimulus current used by the model is shown on the right-hand axis (green).
+
+```julia; echo=false
+println("Searching for individual trace plots...")
+for (group_name, file) in zip(group_names_for_report, trace_files)
+    #display(Markdown.MD(Markdown.parse("## Group: `$group_name`\n")))
+    
+    output_dir = joinpath(output_folder, "Trace", "latest")
+
+    raw_data_path = joinpath(data_folder, file)
+    num_traces_in_file = 0
+    if isfile(raw_data_path)
+        df_raw = CSV.read(raw_data_path, DataFrame; header=4, missingstring="")
+        num_traces_in_file = Int(ncol(df_raw) / 2)
+    end
+    
+    # Find all plot files for the current group
+    plot_files_for_group = []
+    for i in 1:num_traces_in_file # Assuming max 9 traces
+        plot_filename = "$(replace(file, ".csv" => ""))_trace_$(i)_fit.png"
+        plot_path = joinpath(output_dir, plot_filename)
+        if isfile(plot_path)
+            push!(plot_files_for_group, plot_path)
+        end
+    end
+
+    if !isempty(plot_files_for_group)
+        # Load each PNG and create a plot object from it, removing axes and borders
+        image_plots = [plot(load(f), axis=nothing, border=:none) for f in plot_files_for_group]
+        
+        # Determine a nice grid layout (e.g., 3 columns)
+        num_plots = length(image_plots)
+        layout_cols = 3
+        layout_rows = ceil(Int, num_plots / layout_cols)
+        
+        # Create the final grid plot for this group
+        grid_plot = plot(image_plots..., 
+                         layout=(layout_rows, layout_cols), 
+                         size=(1200, 350 * layout_rows), # Adjust size as needed
+                         plot_title="Individual Fits: $(group_name)")
+        
+        # Display the single grid plot for this group
+        savefig(grid_plot, joinpath(images_dir, "individual_fits_$(group_name).png"))
+        display(grid_plot)
+    else
+        println("*No plot files found for group $(group_name) in '$(output_dir)'. Please run the 'traces' workflow.*")
+    end
+end
+```
+
+---
+
+# Group Analysis & Statistical Comparison
+A group-level analysis was performed to compare the model parameters across the different experimental conditions (WT, P, EPN).  
+This involved thousands of model fits initiated from different starting conditions to robustly explore the parameter space.
+
+---
+
+## Parameter Distributions
+The box plots below show the distribution of the final fitted values for each optimized parameter, separated by experimental group.  
+This visualization helps identify which parameters are significantly altered by the experimental conditions.
+
+```julia; echo=false
+# Generate and display box plots
+if sim_data !== nothing
+    boxplot_fig = ActionPotentialPlots.plot_param_boxplots(sim_data, opt_par_names)
+    boxplot_path = joinpath(images_dir, "summary_boxplots.png")
+    savefig(boxplot_fig, boxplot_path)
+
+    display(boxplot_fig)
+else
+    println("*Group analysis data is missing, skipping box plots.*")
+end
+```
+
+
+---
+
+## Average Model Behavior
+To visualize the functional consequences of the parameter shifts,  
+we simulated the model using the average fitted parameters for each group.  
+
+The plot below shows the resulting average action potential for each condition.
+
+```julia; echo=false
+# Generate and display average traces
+if sim_data !== nothing
+    average_model_fig = ActionPotentialPlots.plot_average_traces(sim_data)
+    average_model_path = joinpath(images_dir, "summary_average_models.png")
+    savefig(average_model_fig, average_model_path)
+    
+    display(average_model_fig)
+else
+    println("*Group analysis data is missing, skipping average traces plot.*")
+end
+```
+
+---
+
+# Statistical Modeling
+To formally test for differences, a linear mixed-effects model was fitted for each parameter.  
+
+- Experimental group = fixed effect  
+- Initial parameter randomization (`tbl`) = random effect  
+
+The model summaries are below.
+
+```julia; echo=false
+# Run and display mixed-effects models
+if sim_data !== nothing
+    for param in opt_par_names
+        # Section header
+        display(Markdown.MD(Markdown.parse("### Analysis for Parameter: `$param`\n")))
+
+        try
+            formula = @eval @formula($param ~ 1 + group + (1 + group | tbl))
+            model = fit(MixedModel, formula, sim_data)
+            
+            # Capture model summary
+            io = IOBuffer()
+            show(io, MIME("text/plain"), model)
+            model_output = String(take!(io))
+
+            # Display summary as fenced code block in Markdown
+            display(Markdown.MD(Markdown.parse("```julia\n$model_output\n```")))
+        catch e
+            display(Markdown.MD(Markdown.parse("> Could not fit model for `$param`. Error: `$e`")))
+        end
+    end
+else
+    println("*Group analysis data is missing, skipping statistical models.*")
+end
+```
+
+# Parameter Correlation and Variability
+This section provides additional statistical analysis on the fitted parameters from the group workflow to assess parameter identifiability.
+
+```julia; echo=false
+if sim_data !== nothing
+    # --- Coefficient of Variation Analysis ---
+    display(Markdown.MD(Markdown.parse("## Coefficient of Variation (CV)\n\nThe table below shows the CV for each parameter within each experimental group. Lower values suggest the parameter is more consistently identified by the optimizer.\n")))
+    
+    cv_df = combine(groupby(sim_data, :group)) do sdf
+        cvs = (param => Statistics.std(sdf[!, param]) / Statistics.mean(sdf[!, param]) for param in opt_par_names)
+        return (; group=first(sdf.group), cvs...)
+    end
+    display(cv_df)
+
+    # --- Pairwise Correlation Analysis ---
+    display(Markdown.MD(Markdown.parse("\n## Pairwise Parameter Correlations\n\nThe scatter plots below show pairwise correlations between fitted parameters, colored by experimental group. Strong correlations can indicate issues with parameter identifiability.\n")))
+    
+    # Call the plotting function from the plots module
+    pairwise_fig = ActionPotentialPlots.plot_pairwise_params(sim_data, opt_par_names)
+    pairwise_path = joinpath(images_dir, "pairwise_comparisons.png")
+    savefig(pairwise_fig, pairwise_path)
+    display(pairwise_fig)
+else
+    println("*Group analysis data is missing, skipping advanced statistical analysis.*")
+end
+```
+
+---
+
+# Conclusion
+This automated analysis provides a comprehensive overview of the model fitting results,  
+highlighting key differences in ion channel parameters between experimental groups.
