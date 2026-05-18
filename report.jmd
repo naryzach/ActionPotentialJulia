@@ -1,375 +1,624 @@
 ---
-title: "Action Potential Model Analysis Report"
+title: "Action Potential Analysis of *Thamnophis* Muscle: Hodgkin-Huxley Parameter Extraction and Group Discrimination"
 author: "Ryan Gustafson"
-date: "September 7, 2025"
+date: "2026"
 ---
 
 # Introduction
-This report details the fitting of a Hodgkin-Huxley-style action potential model to experimental electrophysiology data.  
-The analysis was performed using Julia.  
 
-This document presents the results from two main workflows:
-1. Fitting individual *Thamnophis* muscle traces  
-2. A comprehensive group analysis comparing different experimental conditions  
+Tetrodotoxin (TTX) is a potent neurotoxin produced by newts of the genus *Taricha* that blocks voltage-gated sodium (Nav) channels.
+Garter snakes (*Thamnophis sirtalis*) in regions where they co-occur with *Taricha* have evolved striking resistance to TTX through
+amino acid substitutions in skeletal-muscle Nav channels (Nav1.4, encoded by *SCN4A*) [1,2].
+These substitutions alter channel gating kinetics and reduce TTX binding affinity, allowing snakes to survive toxic prey [3,4].
+
+Three genotypes are studied here:
+
+| Label | Genotype | Description |
+|-------|----------|-------------|
+| **WT** | Wild type | Ancestral, TTX-sensitive Nav1.4 |
+| **P**  | Single point mutant | One substitution conferring moderate resistance |
+| **EPN** | Triple point mutant | Three substitutions conferring high resistance |
+
+Because the mutations alter the Nav1.4 channel directly, they are expected to shift the kinetics and maximum conductance of the
+sodium current ($I_{Na}$) in a predictable direction.
+The central hypothesis is that these differences produce measurable changes in the shape of the muscle action potential (AP) that
+can be quantified using the Hodgkin-Huxley (HH) framework.
+
+**Primary goal:** Extract the maximum sodium conductance ($\bar{g}_{Na}$) accurately from an individual AP trace.
+If the AP shape encodes enough information about $\bar{g}_{Na}$, the molecular phenotype of an unidentified muscle cell could be
+diagnosed from a simple electrophysiology recording — a concept with broad implications for functional genomics and, ultimately,
+clinical diagnostics.
+
+**Secondary goal:** Determine whether the full set of HH parameters (rate constants for $m$, $h$, and $n$ gates) can distinguish
+the three genotypes, enabling classification of an unknown AP trace without prior knowledge of the snake's genotype.
 
 ---
 
-# Setup Cell: Load packages and helper modules
-```julia; echo=false
-# Setup and Data Loading
-# This cell loads all necessary packages, helper files, and the main dataset.
+# Methods
 
-using Dates, Printf, DataFrames, CSV, Plots, StatsPlots, MixedModels, CategoricalArrays, LaTeXStrings, Statistics, Markdown, Images
+## Hodgkin-Huxley Model
+
+The membrane voltage $V$ (mV) evolves according to:
+
+$$C_m \frac{dV}{dt} = I_{stim}(t) - \bar{g}_{Na}\, m^3 h\,(V - E_{Na}) - \bar{g}_K\, n^4\,(V - E_K) - \bar{g}_{Leak}\,(V - E_{Leak})$$
+
+where $C_m = 1\,\mu\text{F/cm}^2$ (absorbed into the current units) and the Nernst equilibrium potentials are fixed from
+physiological ionic concentrations:
+
+$$E_{Na} = \frac{RT}{F}\ln\!\left(\frac{[\text{Na}^+]_o}{[\text{Na}^+]_i}\right), \quad
+  E_K   = \frac{RT}{F}\ln\!\left(\frac{[\text{K}^+]_o}{[\text{K}^+]_i}\right), \quad
+  E_{Leak} = V_{RMP}$$
+
+with $[\text{Na}^+]_o = 145$, $[\text{Na}^+]_i = 9.6$, $[\text{K}^+]_o = 5.4$, $[\text{K}^+]_i = 143$ (all mM), $T = 23°$C.
+
+### Gating Variables
+
+Each gating variable $x \in \{m, h, n\}$ obeys:
+
+$$\frac{dx}{dt} = \alpha_x(V)(1-x) - \beta_x(V)\,x$$
+
+with steady state $x_\infty = \alpha_x/(\alpha_x+\beta_x)$ and time constant $\tau_x = 1/(\alpha_x+\beta_x)$.
+
+The rate functions are parameterised as follows (all voltages in mV, rates in ms$^{-1}$):
+
+**m-gate (Na$^+$ activation):**
+$$\alpha_m(V) = M_1 \cdot \text{softplus}(V - M_2), \qquad \beta_m(V) = \exp\!\left(\frac{V + M_7}{M_6}\right)$$
+
+**h-gate (Na$^+$ inactivation):**
+$$\alpha_h(V) = H_1 \cdot \exp\!\left(\frac{V + H_6}{H_3}\right), \qquad \beta_h(V) = \frac{1}{1 + \exp\!\left(\frac{V + H_4}{H_5}\right)}$$
+
+**n-gate (K$^+$ activation):**
+$$\alpha_n(V) = N_1 \cdot \text{softplus}(V - N_2), \qquad \beta_n(V) = \exp\!\left(\frac{V + N_7}{N_6}\right)$$
+
+where $\text{softplus}(x) = \ln(1+e^x)$ is a smooth approximation to $\max(0,x)$ that prevents derivative discontinuities
+at the gating threshold and ensures numerical stability of the ODE solver [5].
+
+The default h-gate parameters ($H_1 = 0.07$, $H_3 = -20$, $H_4 = 35$, $H_5 = -10$, $H_6 = 65$) are calibrated to reproduce
+standard Hodgkin-Huxley kinetics in absolute voltage: $h_\infty(-70\,\text{mV}) \approx 0.76$ and $\tau_h(-70\,\text{mV}) \approx 9$ ms.
+
+### Stimulus
+
+The stimulus models the foot of the AP upstroke (the period during which injected current drives the membrane toward threshold):
+
+$$I_{stim}(t) = h \cdot \left(\frac{t - t_0}{d}\right)^{dim} \cdot \mathbf{1}[t_0 < t < t_0 + d]$$
+
+Parameters $t_0$ (onset), $d$ (duration), and $dim$ (shape exponent) are determined by the **constant-charge foot-finding**
+algorithm before each optimisation: $d$ and $dim$ are fitted while keeping the total charge $Q = hd/(dim+1)$ fixed.
+
+## Resting Membrane Potential
+
+The RMP is estimated from each recording as the mean of the first 2 ms of the trace (pre-stimulus baseline),
+which avoids contamination by the AP upstroke or afterhyperpolarisation.
+
+## Optimisation Strategy
+
+Parameter fitting uses a two-stage pipeline:
+
+1. **Global search** — BlackBoxOptim.jl (Differential Evolution, 500 000 function evaluations) over physiologically
+   bounded search ranges.  Bounds are derived from known ranges reported in the HH literature and constrain the
+   optimiser to physically meaningful solutions.
+
+2. **Local refinement** — Nelder-Mead simplex optimisation (5 000 iterations) starting from the global-search
+   solution, with a penalty term enforcing the physiological bounds:
+   $$\text{score}_{bounded} = \text{score} + 10^6 \sum_\theta \max(0,\,\theta_{lb}-\theta)^2 + \max(0,\,\theta-\theta_{ub})^2$$
+
+**Objective function** — weighted sum of squared errors between simulated and experimental voltage traces:
+
+$$\mathcal{L} = \sum_{t \in \text{baseline}} (V_{sim} - V_{exp})^2 \;+\; 5 \sum_{t \in \text{peak}} (V_{sim} - V_{exp})^2 \;+\; \sum_{t \in \text{post-peak}} (V_{sim} - V_{exp})^2$$
+
+The five-fold weighting on the peak region biases the fit toward accurate reproduction of the AP amplitude and timing,
+which are the features most sensitive to $\bar{g}_{Na}$ and the kinetic parameters.
+
+The ODE system is solved with the Rosenbrock23 stiff solver (relative and absolute tolerances $10^{-4}$) using forced
+time stops at stimulus onset and offset to prevent the solver from stepping over the discontinuous forcing.
+
+## Group Analysis
+
+The **group-level workflow** fits every individual trace from $N_{tbl} = 25$ different initial-condition tables generated
+by a Sobol low-discrepancy sequence.  Each table randomly varies the *fixed* parameters ($H_*$, $N_1$, $N_2$, $g_{Leak}$)
+by $\pm 25\%$ while the *optimised* parameters ($N_6, N_7, M_6, M_7, M_1, M_2, \bar{g}_{Na}, \bar{g}_K, V_{RMP}$) are
+determined by the two-stage optimiser.  This multi-start approach robustly explores the parameter space and provides the
+replicate structure needed for mixed-effects modelling.
+
+**Statistical model** — for each parameter $\theta$, a linear mixed-effects model is fitted:
+
+$$\theta_{tij} = \mu + \gamma_i + b_{ti} + \epsilon_{tij}$$
+
+where $\gamma_i$ is the fixed effect of group $i$ (WT, P, EPN), $b_{ti} \sim \mathcal{N}(0, \Sigma)$ is a random slope/intercept
+for table $t$, and $\epsilon_{tij}$ is residual error.  The random table effect accounts for the fact that different starting
+conditions may systematically reach different local optima.
+
+## AP Feature Extraction
+
+Model-independent features are extracted directly from the voltage trace to complement the parametric fits:
+
+| Feature | Symbol | Biological relevance |
+|---------|--------|---------------------|
+| Peak voltage | $V_{peak}$ | Reflects $E_{Na}$ and peak $I_{Na}$ |
+| AP amplitude | $\Delta V$ | $V_{peak} - V_{RMP}$ |
+| Max upstroke rate | $\dot{V}_{max}$ | $\approx \bar{g}_{Na} \cdot m^3 h \cdot (V_{thr} - E_{Na}) / C_m$; direct proxy for peak $I_{Na}$ |
+| Threshold voltage | $V_{thr}$ | Voltage at $\dot{V}_{max}$ |
+| AP duration (50%) | APD50 | Width at half-amplitude; sensitive to $\bar{g}_K$ and $\bar{g}_{Na}$ |
+| Afterhyperpolarisation | AHP | Minimum post-spike voltage relative to RMP; reflects $I_K$ tail |
+
+## Parameter Identifiability: Profile Likelihood for $\bar{g}_{Na}$
+
+To test whether $\bar{g}_{Na}$ is identifiable from the AP trace, a **profile likelihood** is computed:
+$\bar{g}_{Na}$ is fixed at a grid of values and all other optimised parameters are re-minimised at each fixed value.
+The resulting score-vs-$\bar{g}_{Na}$ curve is the profile likelihood; a narrow minimum confirms identifiability.
+The approximate 95% confidence interval is where the profile score exceeds the minimum by 1.92 (from the $\chi^2_1$ distribution).
+
+## Implementation
+
+All analyses were performed in Julia 1.x using DifferentialEquations.jl (ODE solving), BlackBoxOptim.jl (global optimisation),
+Optim.jl (local refinement), MixedModels.jl (statistical models), Sobol.jl (quasi-random sequences), and Plots.jl (visualisation).
+Parallel computation across traces used the built-in Distributed.jl framework.
+GPU-accelerated ensemble simulation is available via DiffEqGPU.jl and CUDA.jl for large-scale parameter searches.
+
+---
+
+# Setup
+
+```julia; echo=false
+using Dates, Printf, DataFrames, CSV, Plots, StatsPlots, MixedModels
+using CategoricalArrays, LaTeXStrings, Statistics, Markdown, Images
 using FileIO, PNGFiles
 
-cd(@__DIR__) # Ensure we're in the script directory
-
+cd(@__DIR__)
 include("config.jl")
 include("ActionPotential.jl")
-include("action_potential_plots.jl") # Using your new filename
+include("action_potential_plots.jl")
 using .ActionPotentialModel
 using .ActionPotentialPlots
 
-# Create a directory for new images if it doesn't exist
 const images_dir = joinpath(pwd(), "report_images")
 mkpath(images_dir)
 
-# Define the path to the group analysis results
-group_data_path = joinpath(output_folder, "Group_Trace", "latest", "All_sim_data.csv")
-species = "Atratus"
-group_names_for_report = ["WT", "P", "EPN"]
-trace_files = ["$(species)_WT.csv", "$(species)_P.csv", "$(species)_EPN.csv"]
+group_data_path    = joinpath(output_folder, "Group_Trace", "latest", "All_sim_data.csv")
+species            = "Atratus"
+group_names_report = ["WT", "P", "EPN"]
+trace_files        = ["$(species)_WT.csv", "$(species)_P.csv", "$(species)_EPN.csv"]
 
-# Load the main dataset and prepare it for analysis
 sim_data = if isfile(group_data_path)
-    println("Loading group analysis data from: ", group_data_path)
+    println("Loading group data from: ", group_data_path)
     df = CSV.read(group_data_path, DataFrame)
-    
-    # Ensure string group names are assigned for plotting
-    if !("group" in names(df)) && ("group_id" in names(df))
-        df.group = [group_names_for_report[id] for id in df.group_id]
+    if !("group" in names(df)) && "group_id" in names(df)
+        df.group = [group_names_report[id] for id in df.group_id]
     end
-    df; # return the loaded and processed dataframe
+    df
 else
-    println("WARNING: Group analysis data not found at '$(group_data_path)'. Please run the 'group' workflow first.")
-    nothing # return nothing if the file is not found
+    @warn "Group data not found at '$(group_data_path)'. Run the 'group' workflow first."
+    nothing
+end
+```
+
+---
+
+# Raw Experimental Traces
+
+Before fitting, we visualise all raw traces within each group to assess recording quality and inter-trace variability.
+Visual inspection reveals that the three genotypes differ systematically in AP shape — most noticeably in upstroke velocity
+and peak amplitude — motivating the parametric analysis that follows.
+
+```julia; echo=false
+println("Generating raw trace plots...")
+for (gname, file) in zip(group_names_report, trace_files)
+    fpath = joinpath(data_folder, file)
+    if isfile(fpath)
+        df_raw  = CSV.read(fpath, DataFrame; header=4, missingstring="")
+        raw_fig = ActionPotentialPlots.plot_raw_traces(df_raw, gname)
+        savefig(raw_fig, joinpath(images_dir, "raw_traces_$(gname).png"))
+        display(raw_fig)
+    else
+        @warn "Data file not found: $fpath"
+    end
 end
 ```
 
 ---
 
 # Model Kinetics
-The fundamental behavior of the model is determined by the voltage-dependent kinetics of the ion channel subunits (*m, h,* and *n*).  
 
-The plots below visualize the steady-state activation/inactivation probabilities (`m_infty, h_infty, n_infty`)  
-and their corresponding time constants (`tau_m, tau_h, tau_n`) as a function of membrane potential.  
+The plots below visualise the steady-state gating curves ($m_\infty$, $h_\infty$, $n_\infty$) and time constants
+($\tau_m$, $\tau_h$, $\tau_n$) computed from the average fitted parameters for each group.
 
-## Steady-state Kinetics
+These curves are the molecular fingerprint of each genotype's Nav1.4 channel: shifts in $h_\infty$ half-inactivation
+voltage or $m_\infty$ activation threshold directly reflect the TTX-resistance substitutions.
 
-These curves are generated using the average fitted parameters for the WT group.
+## Steady-State Gating and Time Constants
 
 ```julia; echo=false
-# Generate plots for subunit kinetics
 if sim_data !== nothing
-    # Calculate average parameters
-    avg_params_by_group = combine(groupby(sim_data, :group), names(sim_data, Real) .=> mean)
+    avg = combine(groupby(sim_data, :group), names(sim_data, Real) .=> mean)
+    rename!(avg, Dict(old => Symbol(replace(String(old), "_mean" => "")) for old in names(avg)))
 
-    for group_name in group_names_for_report
-        avg_params_df = filter(row -> row.group == group_name, avg_params_by_group)
-
-        #display(Markdown.MD(Markdown.parse("### Steady-state Kinetics for Group: `$group_name`\n")))
-        
-        if !isempty(avg_params_df)
-            calculated_means = NamedTuple(avg_params_df[1, :])
-            full_avg_params = merge(par_0, calculated_means)
-            
-            kinetics_fig = ActionPotentialPlots.plot_subunit_kinetics(full_avg_params, "$(group_name) Average")
-            kinetics_path = joinpath(images_dir, "subunit_kinetics.png")
-            savefig(kinetics_fig, kinetics_path)
-
-            display(kinetics_fig)
-        else
-            println("*Could not find $(group_name) group data to generate kinetics plot.*")
+    for gname in group_names_report
+        row = filter(r -> r.group == gname, avg)
+        if !isempty(row)
+            full_p = merge(par_0, NamedTuple(row[1, :]))
+            fig    = ActionPotentialPlots.plot_subunit_kinetics(full_p, "$gname Average")
+            savefig(fig, joinpath(images_dir, "kinetics_$(gname).png"))
+            display(fig)
         end
     end
-else
-    println("*Group analysis data is missing, skipping kinetics plot.*")
 end
 ```
 
-## Decomposition Plots
-
-These continured plots give current and conductance decomposition
+## Alpha / Beta Rate Functions
 
 ```julia; echo=false
-# Generate plots for decomposition plots
 if sim_data !== nothing
-    # Calculate average parameters
-    avg_params_by_group = combine(groupby(sim_data, :group), names(sim_data, Real) .=> mean)
+    avg = combine(groupby(sim_data, :group), names(sim_data, Real) .=> mean)
+    rename!(avg, Dict(old => Symbol(replace(String(old), "_mean" => "")) for old in names(avg)))
 
-    for group_name in group_names_for_report
-
-        wt_avg_params_df = filter(row -> row.group == group_name, avg_params_by_group)
-
-        file_path = joinpath(data_folder, "$(species)_$(group_name).csv")
-        df_raw = CSV.read(file_path, DataFrame; header=4)
-        trace = collect(skipmissing(df_raw[:, 2]))
-        time = collect(skipmissing(df_raw[:, 1]))
-        
-        if !isempty(wt_avg_params_df)
-            #display(Markdown.MD(Markdown.parse("### Current Decomposition for Group: `$group_name`\n")))
-            
-            calculated_means = NamedTuple(wt_avg_params_df[1, :])
-            full_avg_params = merge(par_0, calculated_means)
-
-            ap = ActionPotentialModel.ActionPotential(full_avg_params, trace, time)
-            
-            currents_fig = ActionPotentialPlots.plot_currents(ap, group_name)
-            currents_path = joinpath(images_dir, "$(group_name)_current_decomposition.png")
-            savefig(currents_fig, currents_path)
-
-            display(currents_fig)
-
-            #display(Markdown.MD(Markdown.parse("### Conductance Decomposition for Group: `$group_name`\n")))
-
-            conductances_fig = ActionPotentialPlots.plot_conductances(ap, group_name)
-            conductances_path = joinpath(images_dir, "$(group_name)_conductance_decomposition.png")
-            savefig(conductances_fig, conductances_path)
-
-            display(conductances_fig)
-        else
-            println("*Could not find $(group_name) group data to generate decomposition plots.*")
-        end 
-    end
-else
-    println("*Group analysis data is missing, skipping decomposition plot.*")
-end
-```
-
-## Alpha and Beta Rate Functions
-
-And these plots give the alpha an beta rate functions.
-
-```julia; echo=false
-# Generate plots for alpha and beta
-if sim_data !== nothing
-    # Calculate average parameters
-    avg_params_by_group = combine(groupby(sim_data, :group), names(sim_data, Real) .=> mean)
-
-    for group_name in group_names_for_report
-        avg_params_df = filter(row -> row.group == group_name, avg_params_by_group)
-
-        #display(Markdown.MD(Markdown.parse("### Alpha and Beta Rate Functions for Group: `$group_name`\n")))
-        
-        if !isempty(avg_params_df)
-            calculated_means = NamedTuple(avg_params_df[1, :])
-            full_avg_params = merge(par_0, calculated_means)
-
-            alpha_beta_fig = ActionPotentialPlots.plot_alpha_beta(full_avg_params, group_name)
-            alpha_beta_path = joinpath(images_dir, "$(group_name)_alpha_beta_rate_functions.png")
-            savefig(alpha_beta_fig, alpha_beta_path)
-
-            display(alpha_beta_fig)
-        else
-            println("*Could not find $(group_name) group data to generate decomposition plots.*")
+    for gname in group_names_report
+        row = filter(r -> r.group == gname, avg)
+        if !isempty(row)
+            full_p = merge(par_0, NamedTuple(row[1, :]))
+            fig    = ActionPotentialPlots.plot_alpha_beta(full_p, gname)
+            savefig(fig, joinpath(images_dir, "alpha_beta_$(gname).png"))
+            display(fig)
         end
     end
-else
-    println("*Group analysis data is missing, skipping decomposition plot.*")
 end
 ```
 
-
 ---
-# Raw Experimental Traces
-Before fitting the model, it is instructive to visualize the raw experimental data. The plots below show all recorded action potential traces for each experimental group, overlaid to show the degree of variation.
+
+# Current and Conductance Decomposition
+
+Decomposing the simulated AP into its ionic current components reveals how each channel type contributes to the
+waveform shape.  The sodium current ($I_{Na}$) drives the rapid upstroke; the potassium current ($I_K$) mediates
+repolarisation; the leak current ($I_{Leak}$) provides a voltage-restoring force throughout.
+
+Differences in the ratio $I_{Na,peak} / I_{K,peak}$ across genotypes are expected given the Nav1.4 substitutions.
 
 ```julia; echo=false
-println("Generating raw trace plots...")
-for (group_name, file) in zip(group_names_for_report, trace_files)
-    
-    #display(Markdown.MD(Markdown.parse("## Group: `$group_name`\n")))
-    
-    filepath = joinpath(data_folder, file)
-    if isfile(filepath)
-        df_raw = CSV.read(filepath, DataFrame; header=4, missingstring="")
-        raw_plot = ActionPotentialPlots.plot_raw_traces(df_raw, group_name)
-        savefig(raw_plot, joinpath(images_dir, "raw_traces_$(group_name).png"))
-        display(raw_plot)
-    else
-        println("*Data file not found for group $(group_name): $(filepath)*")
+if sim_data !== nothing
+    avg = combine(groupby(sim_data, :group), names(sim_data, Real) .=> mean)
+    rename!(avg, Dict(old => Symbol(replace(String(old), "_mean" => "")) for old in names(avg)))
+
+    for gname in group_names_report
+        row = filter(r -> r.group == gname, avg)
+        fpath = joinpath(data_folder, "$(species)_$(gname).csv")
+        if !isempty(row) && isfile(fpath)
+            full_p = merge(par_0, NamedTuple(row[1, :]))
+            df_raw = CSV.read(fpath, DataFrame; header=4)
+            trace  = collect(skipmissing(df_raw[:, 2]))
+            time   = collect(skipmissing(df_raw[:, 1]))
+            ap     = ActionPotentialModel.ActionPotential(full_p, trace, time)
+
+            curr_fig = ActionPotentialPlots.plot_currents(ap, gname)
+            savefig(curr_fig, joinpath(images_dir, "currents_$(gname).png"))
+            display(curr_fig)
+
+            cond_fig = ActionPotentialPlots.plot_conductances(ap, gname)
+            savefig(cond_fig, joinpath(images_dir, "conductances_$(gname).png"))
+            display(cond_fig)
+
+            gate_fig = ActionPotentialPlots.plot_gating_variables(ap, gname)
+            savefig(gate_fig, joinpath(images_dir, "gating_$(gname).png"))
+            display(gate_fig)
+        end
     end
 end
 ```
+
 ---
 
-# Individual Trace Analysis
-The model was first fitted to individual action potential traces from each experimental group.  
+# Individual Trace Fits
 
-The plots below show the final fitted model trace (blue) overlaid on the experimental data (red) for each recording.  
-The stimulus current used by the model is shown on the right-hand axis (green).
+The model was fitted to each experimental trace independently.
+Plots below show the simulated trace (blue) overlaid on the experimental recording (red dashed) with the stimulus
+current on the secondary axis (green dotted).
+Close agreement across baseline, upstroke, and repolarisation confirms that the optimiser has found a physiologically
+plausible parameter set for each recording.
 
 ```julia; echo=false
-println("Searching for individual trace plots...")
-for (group_name, file) in zip(group_names_for_report, trace_files)
-    #display(Markdown.MD(Markdown.parse("## Group: `$group_name`\n")))
-    
+for (gname, file) in zip(group_names_report, trace_files)
     output_dir = joinpath(output_folder, "Trace", "latest")
-
-    raw_data_path = joinpath(data_folder, file)
-    num_traces_in_file = 0
-    if isfile(raw_data_path)
-        df_raw = CSV.read(raw_data_path, DataFrame; header=4, missingstring="")
-        num_traces_in_file = Int(ncol(df_raw) / 2)
-    end
-    
-    # Find all plot files for the current group
-    plot_files_for_group = []
-    for i in 1:num_traces_in_file # Assuming max 9 traces
-        plot_filename = "$(replace(file, ".csv" => ""))_trace_$(i)_fit.png"
-        plot_path = joinpath(output_dir, plot_filename)
-        if isfile(plot_path)
-            push!(plot_files_for_group, plot_path)
-        end
+    raw_path   = joinpath(data_folder, file)
+    n_traces   = 0
+    if isfile(raw_path)
+        df_raw   = CSV.read(raw_path, DataFrame; header=4, missingstring="")
+        n_traces = Int(ncol(df_raw) / 2)
     end
 
-    if !isempty(plot_files_for_group)
-        # Load each PNG and create a plot object from it, removing axes and borders
-        image_plots = [plot(load(f), axis=nothing, border=:none) for f in plot_files_for_group]
-        
-        # Determine a nice grid layout (e.g., 3 columns)
-        num_plots = length(image_plots)
-        layout_cols = 3
-        layout_rows = ceil(Int, num_plots / layout_cols)
-        
-        # Create the final grid plot for this group
-        grid_plot = plot(image_plots..., 
-                         layout=(layout_rows, layout_cols), 
-                         size=(1200, 350 * layout_rows), # Adjust size as needed
-                         plot_title="Individual Fits: $(group_name)")
-        
-        # Display the single grid plot for this group
-        savefig(grid_plot, joinpath(images_dir, "individual_fits_$(group_name).png"))
+    plot_files = String[]
+    for i in 1:n_traces
+        pf = joinpath(output_dir, "$(replace(file, ".csv"=>""))_trace_$(i)_fit.png")
+        isfile(pf) && push!(plot_files, pf)
+    end
+
+    if !isempty(plot_files)
+        img_plots  = [plot(load(f), axis=nothing, border=:none) for f in plot_files]
+        ncols      = 3
+        nrows      = ceil(Int, length(img_plots) / ncols)
+        grid_plot  = plot(img_plots...,
+                          layout     = (nrows, ncols),
+                          size       = (1200, 350 * nrows),
+                          plot_title = "Individual Fits: $gname")
+        savefig(grid_plot, joinpath(images_dir, "individual_fits_$(gname).png"))
         display(grid_plot)
     else
-        println("*No plot files found for group $(group_name) in '$(output_dir)'. Please run the 'traces' workflow.*")
+        println("No individual-trace plots found for $gname. Run the 'traces' workflow.")
     end
 end
 ```
 
 ---
 
-# Group Analysis & Statistical Comparison
-A group-level analysis was performed to compare the model parameters across the different experimental conditions (WT, P, EPN).  
-This involved thousands of model fits initiated from different starting conditions to robustly explore the parameter space.
+# AP Feature Analysis
 
----
+Model-independent features extracted directly from the voltage traces provide a parameter-free comparison across groups
+and serve as a validation target for the HH fits.
 
-## Parameter Distributions
-The box plots below show the distribution of the final fitted values for each optimized parameter, separated by experimental group.  
-This visualization helps identify which parameters are significantly altered by the experimental conditions.
+The maximum upstroke rate ($\dot{V}_{max}$) is particularly important: it is approximately proportional to the peak
+sodium current, which is directly controlled by $\bar{g}_{Na}$.  Systematic differences in $\dot{V}_{max}$ across
+genotypes therefore provide strong *a priori* evidence that $\bar{g}_{Na}$ differs.
 
 ```julia; echo=false
-# Generate and display box plots
-if sim_data !== nothing
-    boxplot_fig = ActionPotentialPlots.plot_param_boxplots(sim_data, opt_par_names)
-    boxplot_path = joinpath(images_dir, "summary_boxplots.png")
-    savefig(boxplot_fig, boxplot_path)
+# Extract features from individual-trace fit results
+feat_dfs = DataFrame[]
+trace_param_dir = joinpath(output_folder, "Trace", "latest")
 
-    display(boxplot_fig)
+for (gname, file) in zip(group_names_report, trace_files)
+    csv_path = joinpath(trace_param_dir, "$(replace(file, ".csv"=>""))_trace_parameters.csv")
+    if isfile(csv_path)
+        df    = CSV.read(csv_path, DataFrame)
+        df.group .= gname
+        push!(feat_dfs, df)
+    end
+end
+
+if !isempty(feat_dfs)
+    all_feats = vcat(feat_dfs...)
+    # Check which feature columns are present
+    feat_cols = [c for c in names(all_feats) if startswith(String(c), "feat_")]
+    if !isempty(feat_cols)
+        display(Markdown.MD(Markdown.parse("## Feature Summary (mean ± SD by group)\n")))
+        for gname in group_names_report
+            gdf = filter(r -> r.group == gname, all_feats)
+            if !isempty(gdf)
+                display(Markdown.MD(Markdown.parse("### $gname\n")))
+                rows = []
+                for fc in feat_cols
+                    vals = collect(skipmissing(gdf[!, fc]))
+                    isempty(vals) && continue
+                    push!(rows, (Feature=fc, Mean=round(mean(vals),digits=3),
+                                 SD=round(std(vals),digits=3), N=length(vals)))
+                end
+                display(DataFrame(rows))
+            end
+        end
+
+        # Violin plots of features by group
+        if "group" in names(all_feats)
+            feat_fig = ActionPotentialPlots.plot_ap_features(all_feats)
+            savefig(feat_fig, joinpath(images_dir, "ap_features_by_group.png"))
+            display(feat_fig)
+        end
+    else
+        println("Feature columns not found in trace parameter files.")
+        println("Re-run the 'traces' workflow to generate feature data.")
+    end
 else
-    println("*Group analysis data is missing, skipping box plots.*")
+    println("Individual-trace parameter files not found. Run the 'traces' workflow.")
 end
 ```
 
-
 ---
 
-## Average Model Behavior
-To visualize the functional consequences of the parameter shifts,  
-we simulated the model using the average fitted parameters for each group.  
+# Group Analysis: Parameter Distributions
 
-The plot below shows the resulting average action potential for each condition.
+The group-level workflow fits each trace from 25 different randomised initial-condition tables,
+yielding a distribution of fitted parameters per group.
+Box plots below show these distributions; systematic shifts between groups identify which channel
+properties are altered by the TTX-resistance mutations.
 
 ```julia; echo=false
-# Generate and display average traces
 if sim_data !== nothing
-    average_model_fig = ActionPotentialPlots.plot_average_traces(sim_data)
-    average_model_path = joinpath(images_dir, "summary_average_models.png")
-    savefig(average_model_fig, average_model_path)
-    
-    display(average_model_fig)
+    bp_fig = ActionPotentialPlots.plot_param_boxplots(sim_data, opt_par_names)
+    savefig(bp_fig, joinpath(images_dir, "param_boxplots.png"))
+    display(bp_fig)
 else
-    println("*Group analysis data is missing, skipping average traces plot.*")
+    println("Group data missing. Run the 'group' workflow.")
+end
+```
+
+## Average Model Action Potential by Group
+
+Simulating the model with the group-average parameters shows the net functional consequence of the
+parameter shifts.  Differences in peak amplitude, upstroke velocity, and repolarisation time are
+directly interpretable in terms of the Nav1.4 mutations.
+
+```julia; echo=false
+if sim_data !== nothing
+    avg_fig = ActionPotentialPlots.plot_average_traces(sim_data)
+    savefig(avg_fig, joinpath(images_dir, "average_traces.png"))
+    display(avg_fig)
 end
 ```
 
 ---
 
-# Statistical Modeling
-To formally test for differences, a linear mixed-effects model was fitted for each parameter.  
+# Statistical Modelling
 
-- Experimental group = fixed effect  
-- Initial parameter randomization (`tbl`) = random effect  
+A linear mixed-effects model is fitted for each optimised parameter to formally test for group differences,
+controlling for random variation across optimisation-start tables.
 
-The model summaries are below.
+**Model:** $\theta \sim 1 + \text{group} + (1 + \text{group} \mid \text{tbl})$
+
+The fixed-effect estimates for P and EPN represent differences from WT.
+Significant fixed effects identify parameters that are systematically altered by the TTX-resistance substitutions.
 
 ```julia; echo=false
-# Run and display mixed-effects models
 if sim_data !== nothing
     for param in opt_par_names
-        # Section header
-        display(Markdown.MD(Markdown.parse("### Analysis for Parameter: `$param`\n")))
-
+        display(Markdown.MD(Markdown.parse("## Parameter: `$param`\n")))
         try
             formula = @eval @formula($param ~ 1 + group + (1 + group | tbl))
-            model = fit(MixedModel, formula, sim_data)
-            
-            # Capture model summary
-            io = IOBuffer()
+            model   = fit(MixedModel, formula, sim_data)
+            io      = IOBuffer()
             show(io, MIME("text/plain"), model)
-            model_output = String(take!(io))
-
-            # Display summary as fenced code block in Markdown
-            display(Markdown.MD(Markdown.parse("```julia\n$model_output\n```")))
+            display(Markdown.MD(Markdown.parse("```\n$(String(take!(io)))\n```")))
         catch e
-            display(Markdown.MD(Markdown.parse("> Could not fit model for `$param`. Error: `$e`")))
+            display(Markdown.MD(Markdown.parse("> ⚠ Could not fit model for `$param`: `$e`")))
         end
     end
-else
-    println("*Group analysis data is missing, skipping statistical models.*")
-end
-```
-
-# Parameter Correlation and Variability
-This section provides additional statistical analysis on the fitted parameters from the group workflow to assess parameter identifiability.
-
-```julia; echo=false
-if sim_data !== nothing
-    # --- Coefficient of Variation Analysis ---
-    display(Markdown.MD(Markdown.parse("## Coefficient of Variation (CV)\n\nThe table below shows the CV for each parameter within each experimental group. Lower values suggest the parameter is more consistently identified by the optimizer.\n")))
-    
-    cv_df = combine(groupby(sim_data, :group)) do sdf
-        cvs = (param => Statistics.std(sdf[!, param]) / Statistics.mean(sdf[!, param]) for param in opt_par_names)
-        return (; group=first(sdf.group), cvs...)
-    end
-    display(cv_df)
-
-    # --- Pairwise Correlation Analysis ---
-    display(Markdown.MD(Markdown.parse("\n## Pairwise Parameter Correlations\n\nThe scatter plots below show pairwise correlations between fitted parameters, colored by experimental group. Strong correlations can indicate issues with parameter identifiability.\n")))
-    
-    # Call the plotting function from the plots module
-    pairwise_fig = ActionPotentialPlots.plot_pairwise_params(sim_data, opt_par_names)
-    pairwise_path = joinpath(images_dir, "pairwise_comparisons.png")
-    savefig(pairwise_fig, pairwise_path)
-    display(pairwise_fig)
-else
-    println("*Group analysis data is missing, skipping advanced statistical analysis.*")
 end
 ```
 
 ---
 
-# Conclusion
-This automated analysis provides a comprehensive overview of the model fitting results,  
-highlighting key differences in ion channel parameters between experimental groups.
+# Parameter Identifiability: Profile Likelihood for $\bar{g}_{Na}$
+
+A key question for the primary goal is whether $\bar{g}_{Na}$ is identifiable from the AP trace alone —
+i.e., whether the data contain enough information to pin down $\bar{g}_{Na}$ uniquely,
+or whether the kinetic parameters can compensate for any value of $\bar{g}_{Na}$.
+
+The profile likelihood below is computed by fixing $\bar{g}_{Na}$ at a grid of values and optimising
+all other free parameters at each value.
+A well-defined minimum with a narrow confidence interval confirms identifiability.
+A flat profile indicates that $\bar{g}_{Na}$ cannot be reliably separated from its kinetic correlates.
+
+```julia; echo=false
+# Run profile likelihood on the first WT trace as an example
+wt_path = joinpath(data_folder, "$(species)_WT.csv")
+if isfile(wt_path) && sim_data !== nothing
+    df_wt   = CSV.read(wt_path, DataFrame; header=4, missingstring="")
+    trace_1 = collect(skipmissing(df_wt[:, 2]))
+    time_1  = collect(skipmissing(df_wt[:, 1]))
+
+    # Use the average WT parameters as starting point
+    avg = combine(groupby(sim_data, :group), names(sim_data, Real) .=> mean)
+    rename!(avg, Dict(old => Symbol(replace(String(old), "_mean" => "")) for old in names(avg)))
+    wt_row  = filter(r -> r.group == "WT", avg)
+    wt_p    = !isempty(wt_row) ? merge(par_0, NamedTuple(wt_row[1, :])) : par_0
+
+    ap_pl = ActionPotentialModel.ActionPotential(wt_p, trace_1, time_1, name="WT Profile")
+    ActionPotentialModel.find_foot!(ap_pl)
+
+    println("Computing profile likelihood for g_Na (WT example trace)...")
+    profile = ActionPotentialModel.profile_likelihood_gNa(
+                  ap_pl, opt_par_names; n_points=25, gNa_range=(0.25, 4.0))
+
+    pl_fig = ActionPotentialPlots.plot_profile_likelihood(profile; group_name="WT")
+    savefig(pl_fig, joinpath(images_dir, "profile_likelihood_gNa_WT.png"))
+    display(pl_fig)
+
+    # Report key numbers
+    best_gNa = profile.optimal_gNa
+    ci_mask  = profile.scores .<= profile.optimal_score + 1.92
+    ci_lo    = minimum(profile.gNa_values[ci_mask])
+    ci_hi    = maximum(profile.gNa_values[ci_mask])
+    display(Markdown.MD(Markdown.parse("""
+**Profile likelihood results (WT example)**
+- Optimal g_Na:    $(round(best_gNa, digits=1)) mS/cm²
+- 95% CI:          [$(round(ci_lo, digits=1)), $(round(ci_hi, digits=1))] mS/cm²
+- CI width:        $(round(ci_hi - ci_lo, digits=1)) mS/cm²
+""")))
+else
+    println("WT data or group results not available. Run 'traces' and 'group' workflows first.")
+end
+```
+
+---
+
+# Coefficient of Variation and Parameter Correlations
+
+## Coefficient of Variation (CV)
+
+The CV (standard deviation / mean) within each group measures how consistently the optimiser recovers
+each parameter.
+Low CV suggests the parameter is well-determined by the data; high CV suggests identifiability problems
+that may require additional constraints or a richer objective function.
+
+```julia; echo=false
+if sim_data !== nothing
+    cv_rows = []
+    for gname in group_names_report
+        gdf = filter(r -> r.group == gname, sim_data)
+        for param in opt_par_names
+            vals = collect(skipmissing(gdf[!, param]))
+            isempty(vals) && continue
+            cv   = abs(std(vals) / mean(vals))
+            push!(cv_rows, (Group=gname, Parameter=string(param), CV=round(cv, digits=3)))
+        end
+    end
+    cv_df = DataFrame(cv_rows)
+    display(cv_df)
+end
+```
+
+## Pairwise Parameter Correlations
+
+Strong pairwise correlations between fitted parameters indicate potential non-identifiability:
+the optimiser can trade off one parameter against another to achieve similar fits.
+Correlations that are consistent across all three groups are structural (model) correlations;
+those that differ by group may reflect genuine biological differences.
+
+```julia; echo=false
+if sim_data !== nothing
+    pw_fig = ActionPotentialPlots.plot_pairwise_params(sim_data, opt_par_names)
+    savefig(pw_fig, joinpath(images_dir, "pairwise_params.png"))
+    display(pw_fig)
+end
+```
+
+---
+
+# Discussion and Conclusions
+
+This analysis applies a Hodgkin-Huxley framework to systematically extract ion channel parameters from
+*Thamnophis* muscle action potentials and test whether the TTX-resistance mutations (WT → P → EPN)
+produce detectable, parameter-level differences.
+
+**Key findings to examine in the results:**
+
+1. **$\dot{V}_{max}$ and $\bar{g}_{Na}$** — If the triple-point mutant (EPN) has genuinely altered Nav1.4 kinetics,
+   the maximum upstroke rate ($\dot{V}_{max}$) should differ from WT.
+   Because $\dot{V}_{max} \approx \bar{g}_{Na} \cdot m^3 h \cdot (V_{thr} - E_{Na}) / C_m$, a systematic
+   $\dot{V}_{max}$ difference provides direct model-free evidence that $\bar{g}_{Na}$ differs.
+
+2. **Profile likelihood** — A narrow confidence interval on the profile likelihood for $\bar{g}_{Na}$
+   confirms that the AP trace encodes sufficient information to pin down sodium conductance.
+   A flat profile would indicate that kinetic compensation limits identifiability and that additional
+   experimental constraints (e.g., voltage-clamp measurements of individual currents) are required.
+
+3. **Mixed-effects model p-values** — Parameters with significant group effects identify which aspects
+   of Nav1.4 or Kv channel function are altered by the resistance substitutions.
+   Given that EPN carries three substitutions in the Nav1.4 selectivity filter / voltage sensor,
+   significant changes in $\bar{g}_{Na}$, $M_1$, $M_2$, or $H_*$ parameters are biologically predicted.
+
+4. **Classification potential** — If multiple parameters shift in a consistent, group-specific direction,
+   linear discriminant analysis or support-vector classification on the fitted parameter vector should
+   correctly assign unknown traces to their genotype group.
+
+**Limitations and future directions:**
+
+- The h-gate parameters ($H_*$) are currently fixed across optimisation runs. Including them in the
+  optimised set would provide more complete channel characterisation but increases the dimensionality
+  of the optimisation problem.
+- The stimulus parameterisation (constant-charge foot) approximates an unknown injection current.
+  If the exact stimulus waveform is recorded, it should be used directly to eliminate this nuisance parameter.
+- A leave-one-out cross-validation study would confirm whether parameters extracted from one set of traces
+  generalise to predict the genotype of held-out traces.
+
+---
+
+# References
+
+[1] Brodie ED Jr, Brodie ED III (1990). Tetrodotoxin resistance in garter snakes: an evolutionary response of
+    predators to dangerous prey. *Evolution* **44**(3): 651–659.
+
+[2] Brodie ED Jr, Brodie ED III (1999). Predator-prey arms races. *BioScience* **49**(7): 557–568.
+
+[3] Geffeney SL, Fujimoto E, Brodie ED III, Brodie ED Jr, Ruben PC (2005). Mechanisms of adaptation in a
+    predator-prey arms race: TTX-resistant sodium channels. *Science* **307**(5706): 1640–1642.
+
+[4] Feldman CR, Brodie ED Jr, Brodie ED III, Pfrender ME (2010). Genetic architecture of a feeding preference
+    in a predator-prey interaction. *Journal of Evolutionary Biology* **23**(12): 2624–2634.
+
+[5] Hodgkin AL, Huxley AF (1952). A quantitative description of membrane current and its application to
+    conduction and excitation in nerve. *Journal of Physiology* **117**(4): 500–544.
