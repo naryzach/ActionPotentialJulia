@@ -15,7 +15,8 @@ using CSV, DataFrames, Printf, Dates, Plots
 # ---------------------------------------------------------------------------
 # Per-file processing
 # ---------------------------------------------------------------------------
-function process_trace_file(file::String, output_dir::String)
+function process_trace_file(file::String, output_dir::String;
+                            use_gpu::Bool=false, num_trajectories::Int=100_000)
     filepath    = joinpath(data_folder, file)
     header_line = readlines(filepath)[4]
     num_cols    = length(split(header_line, ','))
@@ -29,7 +30,7 @@ function process_trace_file(file::String, output_dir::String)
         trace = collect(skipmissing(df_raw[:, 2*i]))
         time  = collect(skipmissing(df_raw[:, 2*i-1]))
         name  = names(df_raw)[2*i]
-        push!(tasks, (par_0, par_bounds, trace, time, name, opt_par_names, USE_GPU, GPU_TRAJECTORIES))
+        push!(tasks, (par_0, par_bounds, trace, time, name, opt_par_names, use_gpu, num_trajectories))
     end
 
     # Worker function — runs on a distributed process
@@ -99,8 +100,6 @@ end
 # Entry point
 # ---------------------------------------------------------------------------
 function main_read_traces(; use_gpu::Bool=false, num_trajectories::Int=100_000)
-    @everywhere global USE_GPU           = $use_gpu
-    @everywhere global GPU_TRAJECTORIES  = $num_trajectories
     println("\n--- Starting: Individual Traces Workflow (GPU=$use_gpu) ---")
     trace_files = ["Atratus_WT.csv", "Atratus_P.csv", "Atratus_EPN.csv"]
 
@@ -112,7 +111,7 @@ function main_read_traces(; use_gpu::Bool=false, num_trajectories::Int=100_000)
     mkpath(archive_dir)
 
     for file in trace_files
-        process_trace_file(file, latest_dir)
+        process_trace_file(file, latest_dir; use_gpu=use_gpu, num_trajectories=num_trajectories)
     end
 
     println("\nArchiving results to $archive_dir ...")

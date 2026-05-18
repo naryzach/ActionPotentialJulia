@@ -36,8 +36,6 @@ end
 # Entry point
 # ---------------------------------------------------------------------------
 function main_group_trace(; use_gpu::Bool=false, num_trajectories::Int=100_000)
-    @everywhere global USE_GPU           = $use_gpu
-    @everywhere global GPU_TRAJECTORIES  = $num_trajectories
     println("\n--- Starting: Group Analysis Workflow (GPU=$use_gpu) ---")
     trace_files  = ["Atratus_WT.csv", "Atratus_P.csv", "Atratus_EPN.csv"]
     group_names  = ["WT", "P", "EPN"]
@@ -69,7 +67,7 @@ function main_group_trace(; use_gpu::Bool=false, num_trajectories::Int=100_000)
                 time  = collect(skipmissing(df_raw[:, 2*indiv_idx-1]))
                 seed  = merge(par_0, fixed_params)
                 push!(tasks, (tbl_idx, grp_idx, indiv_idx, seed, par_bounds, trace, time,
-                              opt_par_group_names, USE_GPU, GPU_TRAJECTORIES))
+                              opt_par_group_names, use_gpu, num_trajectories))
             end
         end
     end
