@@ -2,6 +2,13 @@
 #
 # Fits the Hodgkin-Huxley model to every individual trace in each group file,
 # extracts AP features, saves per-trace plots, and writes parameter CSVs.
+#
+# Parallelism strategy:
+#   CPU mode  — pmap distributes one trace per distributed worker
+#   GPU mode  — map runs traces sequentially on the main process; the GPU
+#               ensemble (100 K+ trajectories) provides parallelism per trace.
+#               Running gpu_grid_search! inside a distributed worker causes
+#               Julia 1.12 world-age errors with DiffEqGPU closures.
 
 using Distributed
 if nprocs() < 4; addprocs(max(1, 4 - nprocs())); end
@@ -11,6 +18,31 @@ if nprocs() < 4; addprocs(max(1, 4 - nprocs())); end
 
 using .ActionPotentialModel
 using CSV, DataFrames, Printf, Dates, Plots
+
+# ---------------------------------------------------------------------------
+# Top-level worker function (must be defined outside any other function to
+# avoid Julia 1.12 world-age errors when called from distributed workers).
+# ---------------------------------------------------------------------------
+@everywhere function fit_trace(task)
+    p0, bounds, trace, time, name, opn, use_gpu, num_traj = task
+    redirect_stdout(devnull) do
+        ap     = ActionPotentialModel.ActionPotential(p0, trace, time, name=name)
+        result = ActionPotentialModel.optimize!(ap, opn; bounds=bounds,
+                                                use_gpu=use_gpu, num_trajectories=num_traj)
+        feats  = ActionPotentialModel.extract_ap_features(ap)
+        return (
+            name           = name,
+            params         = result["par"],
+            value          = result["value"],
+            convergence    = result["convergence"],
+            RMP            = ap.params.RMP,
+            final_stim_d   = ap.stim_d,
+            final_stim_dim = ap.stim_dim,
+            final_tot_wait = ap.tot_wait,
+            features       = feats
+        )
+    end
+end
 
 # ---------------------------------------------------------------------------
 # Per-file processing
@@ -33,31 +65,11 @@ function process_trace_file(file::String, output_dir::String;
         push!(tasks, (par_0, par_bounds, trace, time, name, opt_par_names, use_gpu, num_trajectories))
     end
 
-    # Worker function — runs on a distributed process
-    @everywhere function fit_trace(task)
-        p0, bounds, trace, time, name, opn, use_gpu, num_traj = task
-        redirect_stdout(devnull) do
-            ap     = ActionPotentialModel.ActionPotential(p0, trace, time, name=name)
-            result = ActionPotentialModel.optimize!(ap, opn; bounds=bounds,
-                                                    use_gpu=use_gpu, num_trajectories=num_traj)
-            # Extract AP features from the fitted simulation
-            feats  = ActionPotentialModel.extract_ap_features(ap)
-            return (
-                name          = name,
-                params        = result["par"],
-                value         = result["value"],
-                convergence   = result["convergence"],
-                RMP           = ap.params.RMP,
-                final_stim_d  = ap.stim_d,
-                final_stim_dim = ap.stim_dim,
-                final_tot_wait = ap.tot_wait,
-                features      = feats
-            )
-        end
-    end
-
     println("Fitting $(length(tasks)) traces from $file...")
-    results = pmap(fit_trace, tasks)
+    # GPU: run on main process (closures inside gpu_grid_search! must not cross
+    #      into distributed workers — Julia 1.12 world-age restriction).
+    # CPU: distribute one trace per worker via pmap.
+    results = use_gpu ? map(fit_trace, tasks) : pmap(fit_trace, tasks)
 
     output_basename = replace(file, ".csv" => "")
     results_df      = DataFrame()
@@ -70,7 +82,6 @@ function process_trace_file(file::String, output_dir::String;
         res_dict[:convergence] = res.convergence
         res_dict[:RMP]         = res.RMP
 
-        # Flatten AP features into the row
         if !isnothing(res.features)
             for (k, v) in pairs(res.features)
                 res_dict[Symbol("feat_", k)] = v
@@ -78,7 +89,7 @@ function process_trace_file(file::String, output_dir::String;
         end
         push!(results_df, res_dict; cols=:union)
 
-        # Reconstruct AP object for plotting
+        # Reconstruct AP for plotting using the fitted params
         _, _, orig_trace, orig_time, name, _ = tasks[i]
         plot_ap = ActionPotentialModel.ActionPotential(res.params, orig_trace, orig_time, name=name)
         plot_ap.stim_d   = res.final_stim_d

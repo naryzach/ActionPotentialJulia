@@ -3,6 +3,11 @@
 # Group-level analysis: fits each trace from N randomised initial conditions
 # (Sobol sequence) and runs linear mixed-effects models to test for group
 # differences in HH parameters.
+#
+# Parallelism strategy:
+#   CPU mode  — pmap distributes one fit per distributed worker
+#   GPU mode  — map runs fits sequentially on the main process; the GPU
+#               ensemble provides parallelism per fit.
 
 using Distributed
 if nprocs() < 4; addprocs(max(1, 4 - nprocs())); end
@@ -16,6 +21,34 @@ using Plots, StatsPlots, Statistics
 
 # Parameters optimised in the group workflow (RMP included — free within bounds)
 @everywhere const opt_par_group_names = (:N_6, :N_7, :M_6, :M_7, :M_1, :M_2, :g_Na, :g_K, :RMP)
+
+# ---------------------------------------------------------------------------
+# Top-level worker function (must be defined outside any other function to
+# avoid Julia 1.12 world-age errors when called from distributed workers).
+# ---------------------------------------------------------------------------
+@everywhere function run_group_fit(task)
+    tbl, grp, indiv, seed_p, bounds, trace, time, opn, use_gpu, num_traj = task
+    redirect_stdout(devnull) do
+        ap     = ActionPotentialModel.ActionPotential(seed_p, trace, time,
+                                                      name="T$tbl-G$grp-I$indiv")
+        result = ActionPotentialModel.optimize!(ap, opn; bounds=bounds,
+                                                use_gpu=use_gpu, num_trajectories=num_traj)
+        feats  = ActionPotentialModel.extract_ap_features(ap)
+
+        res = Dict{Symbol, Any}(pairs(result["par"]))
+        res[:tbl]      = tbl
+        res[:group_id] = grp
+        res[:indiv]    = indiv
+        res[:score]    = result["value"]
+
+        if !isnothing(feats)
+            for (k, v) in pairs(feats)
+                res[Symbol("feat_", k)] = v
+            end
+        end
+        return res
+    end
+end
 
 # ---------------------------------------------------------------------------
 # Generate a table of Sobol-randomised starting values for the *fixed*
@@ -51,7 +84,7 @@ function main_group_trace(; use_gpu::Bool=false, num_trajectories::Int=100_000)
     fixed_par_names = Tuple(setdiff(Set(all_par_names), Set(opt_par_group_names)))
     sobol_sets      = get_fixed_parameter_sets(par_0, fixed_par_names, num_tables)
 
-    # Build task list: (table_idx, group_idx, indiv_idx, params, trace, time, opt_names)
+    # Build task list: (table_idx, group_idx, indiv_idx, params, bounds, trace, time, opt_names, gpu, ntraj)
     tasks = []
     for tbl_idx in 1:num_tables
         fixed_params = NamedTuple(sobol_sets[tbl_idx, :])
@@ -72,34 +105,10 @@ function main_group_trace(; use_gpu::Bool=false, num_trajectories::Int=100_000)
         end
     end
 
-    @everywhere function run_group_fit(task)
-        tbl, grp, indiv, seed_p, bounds, trace, time, opn, use_gpu, num_traj = task
-        redirect_stdout(devnull) do
-            ap     = ActionPotentialModel.ActionPotential(seed_p, trace, time,
-                                                          name="T$tbl-G$grp-I$indiv")
-            result = ActionPotentialModel.optimize!(ap, opn; bounds=bounds,
-                                                    use_gpu=use_gpu, num_trajectories=num_traj)
-
-            # Extract AP features from the fitted model
-            feats  = ActionPotentialModel.extract_ap_features(ap)
-
-            res = Dict{Symbol, Any}(pairs(result["par"]))
-            res[:tbl]      = tbl
-            res[:group_id] = grp
-            res[:indiv]    = indiv
-            res[:score]    = result["value"]
-
-            if !isnothing(feats)
-                for (k, v) in pairs(feats)
-                    res[Symbol("feat_", k)] = v
-                end
-            end
-            return res
-        end
-    end
-
     println("Running $(length(tasks)) fits across $num_tables tables...")
-    all_results = pmap(run_group_fit, tasks)
+    # GPU: run on main process — see comment in workflow_read_traces.jl.
+    # CPU: distribute via pmap.
+    all_results = use_gpu ? map(run_group_fit, tasks) : pmap(run_group_fit, tasks)
     sim_data    = DataFrame(all_results)
     sim_data.group = [group_names[id] for id in sim_data.group_id]
 
@@ -114,7 +123,6 @@ function main_group_trace(; use_gpu::Bool=false, num_trajectories::Int=100_000)
         savefig(p_box, joinpath(latest_dir, "boxplot_$(param).png"))
     end
 
-    # AP feature boxplots
     feat_cols = [c for c in names(sim_data) if startswith(String(c), "feat_")]
     for feat in feat_cols
         p_feat = @df sim_data boxplot(:group, cols(Symbol(feat)), group=:group,
