@@ -29,15 +29,16 @@ function process_trace_file(file::String, output_dir::String)
         trace = collect(skipmissing(df_raw[:, 2*i]))
         time  = collect(skipmissing(df_raw[:, 2*i-1]))
         name  = names(df_raw)[2*i]
-        push!(tasks, (par_0, par_bounds, trace, time, name, opt_par_names))
+        push!(tasks, (par_0, par_bounds, trace, time, name, opt_par_names, USE_GPU, GPU_TRAJECTORIES))
     end
 
     # Worker function — runs on a distributed process
     @everywhere function fit_trace(task)
-        p0, bounds, trace, time, name, opn = task
+        p0, bounds, trace, time, name, opn, use_gpu, num_traj = task
         redirect_stdout(devnull) do
             ap     = ActionPotentialModel.ActionPotential(p0, trace, time, name=name)
-            result = ActionPotentialModel.optimize!(ap, opn; bounds=bounds)
+            result = ActionPotentialModel.optimize!(ap, opn; bounds=bounds,
+                                                    use_gpu=use_gpu, num_trajectories=num_traj)
             # Extract AP features from the fitted simulation
             feats  = ActionPotentialModel.extract_ap_features(ap)
             return (
@@ -97,8 +98,10 @@ end
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-function main_read_traces()
-    println("\n--- Starting: Individual Traces Workflow ---")
+function main_read_traces(; use_gpu::Bool=false, num_trajectories::Int=100_000)
+    @everywhere global USE_GPU           = $use_gpu
+    @everywhere global GPU_TRAJECTORIES  = $num_trajectories
+    println("\n--- Starting: Individual Traces Workflow (GPU=$use_gpu) ---")
     trace_files = ["Atratus_WT.csv", "Atratus_P.csv", "Atratus_EPN.csv"]
 
     latest_dir  = joinpath(output_folder, "Trace", "latest")

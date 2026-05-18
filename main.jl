@@ -2,16 +2,24 @@
 #
 # Entry point for the Action Potential analysis pipeline.
 #
-# Usage:
-#   julia main.jl --workflow traces  [--cores N]
-#   julia main.jl --workflow group   [--cores N]
-#   julia main.jl --workflow report
+# ── CPU-only (local, 8 cores) ──────────────────────────────────────────────
+#   julia -t 8 main.jl --workflow traces --cores 8
 #
-# Human-in-the-loop initial parameters:
-#   Run the Pluto notebook `interactive_sliders.jl` to tune starting parameters
-#   and export them to `initial_params.json`.  If that file is present in the
-#   project directory, the workflows load it as the initial parameter set
-#   instead of the built-in par_0 defaults.
+# ── GPU-accelerated (local or server) ─────────────────────────────────────
+#   julia -t 8 main.jl --workflow traces --cores 8 --gpu --trajectories 500000
+#
+# ── Large server run (64 cores, 500 K GPU trajectories) ───────────────────
+#   julia -t 64 main.jl --workflow group --cores 64 --gpu --trajectories 500000
+#
+# Thread count (-t N) controls @threads parallelism (foot-finding, profile
+# likelihood, etc.).  --cores N controls distributed worker count for pmap
+# (one independent trace fit per worker).  Both are useful simultaneously:
+#   --cores = N_workers for pmap
+#   -t N    = threads per worker (default 1 unless you set JULIA_NUM_THREADS)
+#
+# Human-in-the-loop parameters:
+#   Run interactive_sliders.jl in Pluto, click "Export Parameters", and the
+#   resulting initial_params.json is loaded automatically here.
 
 using ArgParse, Distributed, Dates, JSON3
 
@@ -20,16 +28,13 @@ include("workflow_group_trace.jl")
 include("workflow_report.jl")
 
 # ---------------------------------------------------------------------------
-# Load optional user-supplied initial parameters from interactive_sliders.jl
+# Load optional user-tuned initial parameters (from interactive_sliders.jl)
 # ---------------------------------------------------------------------------
 function maybe_load_user_params(base_params::NamedTuple)
     json_path = joinpath(pwd(), "initial_params.json")
-    if !isfile(json_path)
-        return base_params
-    end
+    isfile(json_path) || return base_params
     println("Found initial_params.json — overriding defaults with user-tuned parameters.")
     raw    = JSON3.read(read(json_path, String))
-    # Only keep keys that are actual model parameters (skip _stim_* prefixed keys)
     merged = Dict{Symbol, Any}()
     for (k, v) in pairs(raw)
         k_sym = Symbol(k)
@@ -41,7 +46,7 @@ function maybe_load_user_params(base_params::NamedTuple)
 end
 
 # ---------------------------------------------------------------------------
-# CLI
+# CLI argument parsing
 # ---------------------------------------------------------------------------
 function parse_commandline()
     s = ArgParseSettings(description="Run Action Potential modelling workflows.")
@@ -50,29 +55,46 @@ function parse_commandline()
             help     = "Workflow: 'traces', 'group', or 'report'"
             required = true
         "--cores", "-c"
-            help     = "Number of parallel worker processes"
+            help     = "Distributed worker processes for pmap (one trace per worker)"
             arg_type = Int
             default  = 4
+        "--gpu"
+            help     = "Replace BlackBoxOptim global search with GPU grid search (requires CUDA)"
+            action   = :store_true
+        "--trajectories"
+            help     = "Number of GPU trajectories per trace (default 100_000; use 500_000+ on server GPU)"
+            arg_type = Int
+            default  = 100_000
     end
     return parse_args(s)
 end
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 function main()
-    args     = parse_commandline()
-    workflow = args["workflow"]
-    cores    = args["cores"]
+    args         = parse_commandline()
+    workflow     = args["workflow"]
+    cores        = args["cores"]
+    use_gpu      = args["gpu"]
+    num_traj     = args["trajectories"]
+
+    if use_gpu
+        println("GPU mode enabled — will use CUDA for global search ($(num_traj) trajectories/trace).")
+        println("Julia threads available: $(Threads.nthreads())")
+        println("Note: start Julia with -t N to set thread count for @threads parallelism.")
+    end
 
     if workflow in ["traces", "group"]
-        println("\nSetting up '$workflow' workflow with $cores cores...")
         procs_to_add = max(0, cores - 1)
         added_procs  = Int[]
 
         try
             if procs_to_add > 0
-                println("Adding $procs_to_add worker processes...")
+                println("Adding $procs_to_add distributed worker processes...")
                 added_procs = addprocs(procs_to_add)
             end
-            println("Workers ready: $(nprocs()) total processes.")
+            println("Workers ready: $(nprocs()) total.  Julia threads: $(Threads.nthreads())")
 
             @everywhere begin
                 include("config.jl")
@@ -81,9 +103,9 @@ function main()
             println("Code loaded on all processes.")
 
             if workflow == "traces"
-                main_read_traces()
+                main_read_traces(; use_gpu=use_gpu, num_trajectories=num_traj)
             elseif workflow == "group"
-                main_group_trace()
+                main_group_trace(; use_gpu=use_gpu, num_trajectories=num_traj)
             end
 
         catch e

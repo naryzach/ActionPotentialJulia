@@ -9,7 +9,8 @@ using CUDA, DiffEqGPU
 
 export ActionPotential, optimize!, display_action_potential,
        extract_ap_features, profile_likelihood_gNa,
-       update_model!, get_full_trace_details, create_ap_plot
+       update_model!, get_full_trace_details, create_ap_plot,
+       _score_from_trace
 
 # ---------------------------------------------------------------------------
 # Rate-function helpers (standalone for type-stability)
@@ -105,19 +106,24 @@ function _simulate_trace(params::NamedTuple, time_points::Vector{Float64}, dt::F
 end
 
 # ---------------------------------------------------------------------------
-# Weighted sum-of-squares score (pure, no side effects)
+# Scoring functions (pure, no side effects)
 # ---------------------------------------------------------------------------
-function _calculate_score(params::NamedTuple,
-                           time_points::Vector{Float64},
-                           dt::Float64,
-                           experimental_trace_padded::Vector{Float64},
-                           stabil_time::Float64,
-                           trace_data_len::Int)
-    simulated_Vs = _simulate_trace(params, time_points, dt)
-    if isinf(simulated_Vs[1]); return Inf; end
+
+# Core scoring given an already-computed voltage vector.
+# Separated from _calculate_score so GPU grid search can use the GPU-solved
+# trajectory directly without re-solving on CPU.
+function _score_from_trace(simulated_Vs::Vector{Float64},
+                            tot_wait::Float64,
+                            time_points::Vector{Float64},
+                            dt::Float64,
+                            experimental_trace_padded::Vector{Float64},
+                            stabil_time::Float64,
+                            trace_data_len::Int)
+    isempty(simulated_Vs) && return Inf
+    any(isinf, simulated_Vs) && return Inf
 
     pk_dur_est = 5.0
-    peak_start = params.tot_wait
+    peak_start = tot_wait
     peak_end   = peak_start + pk_dur_est
 
     idx_baseline  = (time_points .>= stabil_time) .& (time_points .<  peak_start)
@@ -130,6 +136,19 @@ function _calculate_score(params::NamedTuple,
         sum((simulated_Vs[idx_post_peak] .- experimental_trace_padded[idx_post_peak]).^2)
     )
     return isfinite(score_val) ? score_val : Inf
+end
+
+# Simulate and score in one call (used by CPU optimisers).
+function _calculate_score(params::NamedTuple,
+                           time_points::Vector{Float64},
+                           dt::Float64,
+                           experimental_trace_padded::Vector{Float64},
+                           stabil_time::Float64,
+                           trace_data_len::Int)
+    simulated_Vs = _simulate_trace(params, time_points, dt)
+    isinf(simulated_Vs[1]) && return Inf
+    return _score_from_trace(simulated_Vs, params.tot_wait, time_points, dt,
+                              experimental_trace_padded, stabil_time, trace_data_len)
 end
 
 # ---------------------------------------------------------------------------
@@ -346,9 +365,11 @@ function profile_likelihood_gNa(ap::ActionPotential, opt_param_names::Tuple;
         trace_data_len = length(ap.trace_data)
     )
 
+    # Each g_Na value is an independent optimisation — run in parallel threads.
     profile_scores = Vector{Float64}(undef, n_points)
-    for (i, gNa_fixed) in enumerate(gNa_values)
-        fixed_p = merge(ap.params, (g_Na = gNa_fixed,))
+    Threads.@threads for i in 1:n_points
+        gNa_fixed = gNa_values[i]
+        fixed_p   = merge(ap.params, (g_Na = gNa_fixed,))
         function obj(p_vec)
             iter_p = merge(fixed_p, static_data, (; zip(remaining, p_vec)...))
             score  = _calculate_score(iter_p, static_data.time_points, static_data.dt,
@@ -415,16 +436,13 @@ function find_foot!(ap::ActionPotential; num_fits=10)
         return sum((model_window .- exp_window).^2)
     end
 
-    best_result = nothing; min_val = Inf
-    for i in 1:num_fits
+    # Independent fits from different starting points — run in parallel threads.
+    results = Vector{Any}(undef, num_fits)
+    Threads.@threads for i in 1:num_fits
         t0_guess   = (i / num_fits) * 0.5
-        init_vec   = [t0_guess, init_p.d, init_p.dim]
-        result     = optimize(objective, init_vec, NelderMead())
-        if Optim.minimum(result) < min_val
-            min_val     = Optim.minimum(result)
-            best_result = result
-        end
+        results[i] = optimize(objective, [t0_guess, init_p.d, init_p.dim], NelderMead())
     end
+    best_result = results[argmin(Optim.minimum.(results))]
 
     t_0, stim_d, stim_dim = Optim.minimizer(best_result)
     ap.stim_d   = stim_d
@@ -533,16 +551,30 @@ end
 
 # ---------------------------------------------------------------------------
 # Full two-stage optimisation pipeline
+#
+# use_gpu=true  — replace BlackBoxOptim global search with GPU grid search.
+#                 Requires CUDA.jl and a CUDA-capable GPU.  Pass
+#                 num_trajectories to control the GPU search budget
+#                 (default 100_000; use 500_000+ on a server GPU).
+# use_gpu=false — standard CPU-only pipeline (BlackBoxOptim + NelderMead).
 # ---------------------------------------------------------------------------
 function optimize!(ap::ActionPotential, opt_param_names::Tuple;
-                   bounds::Union{NamedTuple,Nothing} = nothing)
+                   bounds::Union{NamedTuple,Nothing} = nothing,
+                   use_gpu::Bool = false,
+                   num_trajectories::Int = 100_000)
     find_foot!(ap)
 
-    global_result = global_optimize(ap, opt_param_names;
-                                    max_evals=500000, range=0.9, bounds=bounds)
+    if use_gpu
+        println("GPU mode: running grid search with $num_trajectories trajectories...")
+        global_result = gpu_grid_search!(ap, opt_param_names;
+                                          num_trajectories=num_trajectories, range=0.9)
+    else
+        global_result = global_optimize(ap, opt_param_names;
+                                         max_evals=500_000, range=0.9, bounds=bounds)
+    end
     update_model!(ap, global_result["par"])
 
-    final_result  = optimize_model(ap, opt_param_names; bounds=bounds)
+    final_result = optimize_model(ap, opt_param_names; bounds=bounds)
     update_model!(ap, final_result["par"])
 
     return Dict("par" => final_result["par"], "value" => final_result["value"],
@@ -588,24 +620,43 @@ function gpu_grid_search!(ap::ActionPotential, opt_param_names::Tuple;
         remake(prob, u0=u0_i, p=iter_p)
     end
 
+    # Track the best result via a closure — output_func runs on the host side
+    # after each GPU kernel completes, so a ReentrantLock makes it thread-safe.
+    best_idx_ref   = Ref{Int}(1)
+    best_score_ref = Ref{Float64}(Inf)
+    lk             = ReentrantLock()
+
     function output_func(sol, i)
-        sol.retcode != :Success && return Inf
-        _calculate_score(sol.prob.p, time_points, dt, experimental_trace,
-                         ap.stabil_time, length(ap.trace_data))
+        # Use the GPU-computed solution directly — do NOT call _simulate_trace
+        # here (that would re-solve the ODE on CPU, defeating the GPU entirely).
+        if sol.retcode != :Success || length(sol.u) != length(time_points)
+            return (Inf, false)
+        end
+        simV  = [u[1] for u in sol.u]
+        score = _score_from_trace(simV, sol.prob.p.tot_wait, time_points, dt,
+                                   experimental_trace, ap.stabil_time,
+                                   length(ap.trace_data))
+        lock(lk) do
+            if score < best_score_ref[]
+                best_score_ref[] = score
+                best_idx_ref[]   = i
+            end
+        end
+        return (score, false)
     end
 
     ensemble_prob = EnsembleProblem(prob; prob_func=prob_func, output_func=output_func,
-                                    reduction=(u, data, I) -> (min(u, data), false))
+                                    reduction=(u, data, I) -> (append!(u, [data[1]]), false),
+                                    u_init = Float64[])
     sol = solve(ensemble_prob, GPUTsit5(),
                 DiffEqGPU.EnsembleGPUKernel(CUDABackend());
                 trajectories=num_trajectories, saveat=dt)
 
-    best_score = sol.u
-    scores     = [output_func(solve(prob_func(prob, i, 0), RK4(), dt=dt), i)
-                  for i in 1:num_trajectories]
-    best_idx   = argmin(scores)
+    best_idx    = best_idx_ref[]
+    best_score  = best_score_ref[]
     full_params = merge(initial_params, param_sets[best_idx])
-    println("GPU grid search complete. Best score: ", best_score)
+    println("GPU grid search complete. Best score: ", best_score,
+            "  (trajectory ", best_idx, " of ", num_trajectories, ")")
     return Dict("par" => full_params, "value" => best_score)
 end
 

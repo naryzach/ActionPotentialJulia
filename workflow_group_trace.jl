@@ -35,8 +35,10 @@ end
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-function main_group_trace()
-    println("\n--- Starting: Group Analysis Workflow ---")
+function main_group_trace(; use_gpu::Bool=false, num_trajectories::Int=100_000)
+    @everywhere global USE_GPU           = $use_gpu
+    @everywhere global GPU_TRAJECTORIES  = $num_trajectories
+    println("\n--- Starting: Group Analysis Workflow (GPU=$use_gpu) ---")
     trace_files  = ["Atratus_WT.csv", "Atratus_P.csv", "Atratus_EPN.csv"]
     group_names  = ["WT", "P", "EPN"]
     num_tables   = 25
@@ -66,17 +68,19 @@ function main_group_trace()
                 trace = collect(skipmissing(df_raw[:, 2*indiv_idx]))
                 time  = collect(skipmissing(df_raw[:, 2*indiv_idx-1]))
                 seed  = merge(par_0, fixed_params)
-                push!(tasks, (tbl_idx, grp_idx, indiv_idx, seed, par_bounds, trace, time, opt_par_group_names))
+                push!(tasks, (tbl_idx, grp_idx, indiv_idx, seed, par_bounds, trace, time,
+                              opt_par_group_names, USE_GPU, GPU_TRAJECTORIES))
             end
         end
     end
 
     @everywhere function run_group_fit(task)
-        tbl, grp, indiv, seed_p, bounds, trace, time, opn = task
+        tbl, grp, indiv, seed_p, bounds, trace, time, opn, use_gpu, num_traj = task
         redirect_stdout(devnull) do
             ap     = ActionPotentialModel.ActionPotential(seed_p, trace, time,
                                                           name="T$tbl-G$grp-I$indiv")
-            result = ActionPotentialModel.optimize!(ap, opn; bounds=bounds)
+            result = ActionPotentialModel.optimize!(ap, opn; bounds=bounds,
+                                                    use_gpu=use_gpu, num_trajectories=num_traj)
 
             # Extract AP features from the fitted model
             feats  = ActionPotentialModel.extract_ap_features(ap)
