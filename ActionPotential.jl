@@ -1,4 +1,4 @@
-# ActionPotential.jl (High-Performance Version)
+# ActionPotential.jl
 
 module ActionPotentialModel
 
@@ -7,67 +7,72 @@ using Sobol, DataFrames, CSV, Distributed
 using QuadGK, StaticArrays, BlackBoxOptim
 using CUDA, DiffEqGPU
 
-export ActionPotential, optimize!, display_action_potential
+export ActionPotential, optimize!, display_action_potential,
+       extract_ap_features, profile_likelihood_gNa,
+       update_model!, get_full_trace_details, create_ap_plot
 
-# --- Helper functions are now standalone for type-stability ---
+# ---------------------------------------------------------------------------
+# Rate-function helpers (standalone for type-stability)
+# ---------------------------------------------------------------------------
 
-# Nernst equation
+# Nernst equilibrium potential (V); z = valence, concentrations in mM.
 nernst(z, cons_out, cons_in) = (8.31446 * 296.15) / (z * 96.485) * log(cons_out / cons_in)
 
-# Helper for a smooth transition from 0, approximating max(0, x).
-# This avoids derivative discontinuities that can cause solver instability.
+# Numerically-stable softplus approximating max(0, x).
+# Avoids derivative discontinuities that destabilise the ODE solver.
 function smooth_max_zero(x, k=20.0)
-    # This is a numerically stable implementation of `log(1 + exp(k*x)) / k`.
-    # The naive implementation `log1p(exp(k*x))/k` overflows when `k*x` is large.
     val = k * x
     if val > 0
-        # log(1+exp(x)) = log(exp(x)*(exp(-x)+1)) = x + log(1+exp(-x)) = x + log1p(exp(-x))
         return (val + log1p(exp(-val))) / k
     else
         return log1p(exp(val)) / k
     end
 end
 
-# Gating variable alpha/beta rate functions
-# The original formulation had a sharp corner, causing solver instability.
-# We use the smooth_max_zero function to create a smooth, differentiable transition.
+# ---------------------------------------------------------------------------
+# Hodgkin-Huxley gating-variable rate functions (all voltages in mV,
+# rates in ms⁻¹).  Parameter naming convention:
+#   _1 = pre-exponential scale, _2 = voltage threshold / shift,
+#   _3 = slope (exponential), _4/_5/_6 = additional shape parameters.
+# ---------------------------------------------------------------------------
 alpha_n(V, p) = p.N_1 * smooth_max_zero(V - p.N_2)
-beta_n(V, p) = exp((V + p.N_7) / p.N_6)
-alpha_m(V, p) = p.M_1 * smooth_max_zero(V - p.M_2)
-beta_m(V, p) = exp((V + p.M_7) / p.M_6)
-alpha_h(V, p) = exp((V + p.H_6) / p.H_3)
-beta_h(V, p) = 1.0 / (1.0 + exp((V + p.H_4) / p.H_5))
+beta_n(V, p)  = exp((V + p.N_7) / p.N_6)
 
-# Gating variable steady-state value (infty)
+alpha_m(V, p) = p.M_1 * smooth_max_zero(V - p.M_2)
+beta_m(V, p)  = exp((V + p.M_7) / p.M_6)
+
+# H_1 is the pre-exponential scale factor for alpha_h (analogous to N_1 for n
+# and M_1 for m).  Its presence is required to independently set both infty_h
+# and tau_h; without it the two are coupled through the remaining H parameters.
+alpha_h(V, p) = p.H_1 * exp((V + p.H_6) / p.H_3)
+beta_h(V, p)  = 1.0 / (1.0 + exp((V + p.H_4) / p.H_5))
+
+# Steady-state (infinity) values
 infty_n(V, p) = alpha_n(V, p) / (alpha_n(V, p) + beta_n(V, p))
 infty_m(V, p) = alpha_m(V, p) / (alpha_m(V, p) + beta_m(V, p))
 infty_h(V, p) = alpha_h(V, p) / (alpha_h(V, p) + beta_h(V, p))
 
-# Stimulus function
+# Power-law stimulus that rises from 0 to stim_h over duration stim_d.
 stim_function(t, stim_d, stim_h, stim_dim) = stim_h * (t / stim_d)^stim_dim
 
-# --- Hodgkin-Huxley model differential equations ---
-
+# ---------------------------------------------------------------------------
+# Hodgkin-Huxley ODE system
+# ---------------------------------------------------------------------------
 function hodgkin_huxley(u, p, t)
     V, n, m, h = u
 
-    # Nernst potentials (can be pre-calculated, but fine here for clarity)
-    E_K = nernst(1, 5.4, 143)
-    E_Na = nernst(1, 145, 9.6)
-    #E_Leak = nernst(-1, 127.7, 8.7)
-    E_Leak = p.RMP # RMP is now passed in as a parameter
+    E_K    = nernst(1, 5.4,  143)    # K⁺ Nernst potential (mV)
+    E_Na   = nernst(1, 145,  9.6)    # Na⁺ Nernst potential (mV)
+    E_Leak = p.RMP                    # Leak reversal = RMP (no net leak at rest)
 
-    # Calculate currents
-    I_K = p.g_K * n^4 * (V - E_K)
-    I_Na = p.g_Na * m^3 * h * (V - E_Na)
-    I_Leak = p.g_Leak * (V - E_Leak)
-    I_m = I_K + I_Na + I_Leak
+    I_K    = p.g_K   * n^4     * (V - E_K)
+    I_Na   = p.g_Na  * m^3 * h * (V - E_Na)
+    I_Leak = p.g_Leak           * (V - E_Leak)
 
-    # Stimulus (stimulus params are now passed in via `p`)
-    I_stim = (p.tot_wait < t < p.tot_wait + p.stim_d) ? stim_function((t - p.tot_wait), p.stim_d, p.stim_h, p.stim_dim) : 0.0
+    I_stim = (p.tot_wait < t < p.tot_wait + p.stim_d) ?
+             stim_function(t - p.tot_wait, p.stim_d, p.stim_h, p.stim_dim) : 0.0
 
-    # Differentials
-    dV = I_stim - I_m
+    dV = I_stim - (I_K + I_Na + I_Leak)
     dn = alpha_n(V, p) * (1 - n) - beta_n(V, p) * n
     dm = alpha_m(V, p) * (1 - m) - beta_m(V, p) * m
     dh = alpha_h(V, p) * (1 - h) - beta_h(V, p) * h
@@ -75,54 +80,79 @@ function hodgkin_huxley(u, p, t)
     return @SVector [dV, dn, dm, dh]
 end
 
-# This function takes parameters and returns a voltage trace, with no side effects.
+# ---------------------------------------------------------------------------
+# Pure simulation (no side effects)
+# ---------------------------------------------------------------------------
 function _simulate_trace(params::NamedTuple, time_points::Vector{Float64}, dt::Float64)
-    u0 = @SVector [params.RMP, infty_n(params.RMP, params), infty_m(params.RMP, params), infty_h(params.RMP, params)]
+    u0    = @SVector [params.RMP,
+                      infty_n(params.RMP, params),
+                      infty_m(params.RMP, params),
+                      infty_h(params.RMP, params)]
     tspan = (time_points[1], time_points[end])
-    prob = ODEProblem(hodgkin_huxley, u0, tspan, params)
+    prob  = ODEProblem(hodgkin_huxley, u0, tspan, params)
 
-    # To ensure the solver does not step over the stimulus, we force it to
-    # stop at the exact start and end times. `tstops` is a lightweight and
-    # robust way to handle this for discontinuous forcing functions.
-    stim_on_time = params.tot_wait
-    stim_off_time = params.tot_wait + params.stim_d
+    stim_on  = params.tot_wait
+    stim_off = params.tot_wait + params.stim_d
 
-    sol = solve(prob, Rosenbrock23(), saveat=dt, reltol=1e-4, abstol=1e-4, tstops=[stim_on_time, stim_off_time])
+    sol = solve(prob, Rosenbrock23(),
+                saveat = dt, reltol = 1e-4, abstol = 1e-4,
+                tstops = [stim_on, stim_off])
 
     if sol.retcode != :Success || length(sol.u) != length(time_points)
-        return fill(Inf, length(time_points)) 
-    else
-        return [v[1] for v in sol.u]
+        return fill(Inf, length(time_points))
     end
+    return [v[1] for v in sol.u]
 end
 
-# This function takes parameters and data, and returns a score, with no side effects.
-function _calculate_score(params::NamedTuple, time_points::Vector{Float64}, dt::Float64, experimental_trace_padded::Vector{Float64}, stabil_time::Float64, trace_data_len::Int)
+# ---------------------------------------------------------------------------
+# Weighted sum-of-squares score (pure, no side effects)
+# ---------------------------------------------------------------------------
+function _calculate_score(params::NamedTuple,
+                           time_points::Vector{Float64},
+                           dt::Float64,
+                           experimental_trace_padded::Vector{Float64},
+                           stabil_time::Float64,
+                           trace_data_len::Int)
     simulated_Vs = _simulate_trace(params, time_points, dt)
     if isinf(simulated_Vs[1]); return Inf; end
 
     pk_dur_est = 5.0
     peak_start = params.tot_wait
-    peak_end = peak_start + pk_dur_est
-    
-    # Define scoring windows correctly
-    # 1. The entire baseline, from the start of the data to the stimulus
-    idx_baseline = (time_points .>= stabil_time) .& (time_points .< peak_start)
-    # 2. The peak region
-    idx_peak = (time_points .>= peak_start) .& (time_points .<= peak_end)
-    # 3. The post-peak region
-    idx_post_peak = (time_points .> peak_end) .& (time_points .< (stabil_time + trace_data_len * dt))
-    
-    # Sum the weighted errors from all three regions
-    score_val = sum((simulated_Vs[idx_baseline] .- experimental_trace_padded[idx_baseline]).^2) +
-                5.0 * sum((simulated_Vs[idx_peak] .- experimental_trace_padded[idx_peak]).^2) +
-                sum((simulated_Vs[idx_post_peak] .- experimental_trace_padded[idx_post_peak]).^2)
+    peak_end   = peak_start + pk_dur_est
 
+    idx_baseline  = (time_points .>= stabil_time) .& (time_points .<  peak_start)
+    idx_peak      = (time_points .>= peak_start)  .& (time_points .<= peak_end)
+    idx_post_peak = (time_points .>  peak_end)    .& (time_points .<  (stabil_time + trace_data_len * dt))
+
+    score_val = (
+        sum((simulated_Vs[idx_baseline]  .- experimental_trace_padded[idx_baseline]).^2)  +
+        5.0 * sum((simulated_Vs[idx_peak] .- experimental_trace_padded[idx_peak]).^2)     +
+        sum((simulated_Vs[idx_post_peak] .- experimental_trace_padded[idx_post_peak]).^2)
+    )
     return isfinite(score_val) ? score_val : Inf
 end
 
-# --- Main Action Potential structure ---
+# ---------------------------------------------------------------------------
+# Bounds-penalty helper
+# ---------------------------------------------------------------------------
+function _bounds_penalty(p_vec, param_names::Tuple, bounds::NamedTuple)
+    penalty = 0.0
+    for (k, v) in zip(param_names, p_vec)
+        if haskey(bounds, k)
+            lb, ub = bounds[k]
+            if v < lb
+                penalty += 1e6 * (lb - v)^2
+            elseif v > ub
+                penalty += 1e6 * (v - ub)^2
+            end
+        end
+    end
+    return penalty
+end
 
+# ---------------------------------------------------------------------------
+# Main ActionPotential struct
+# ---------------------------------------------------------------------------
 mutable struct ActionPotential
     name::String
     params::NamedTuple
@@ -139,336 +169,483 @@ mutable struct ActionPotential
     AP_val::Vector{Float64}
 end
 
-# --- Constructor ---
-
+# ---------------------------------------------------------------------------
+# Constructor
+# ---------------------------------------------------------------------------
 function ActionPotential(p_in::Union{NamedTuple, Dict}, trace, time; name="Nameless")
     initial_params = typeof(p_in) <: Dict ? NamedTuple(p_in) : p_in
-    dt = round(time[2] - time[1], digits=3)
-    sim_time = 30.0; stabil_time = 10.0; t_sim = 0:dt:sim_time
+    dt          = round(time[2] - time[1], digits=3)
+    sim_time    = 30.0
+    stabil_time = 10.0
+    t_sim       = 0:dt:sim_time
 
-    # First, calculate the RMP from the trace data
-    peak_approx_time = 2.0; pk_dur_est = 5.0
-    early_trace = trace[1:round(Int, peak_approx_time / dt)]
-    late_trace_start = round(Int, (pk_dur_est + 1) / dt)
-    late_trace_end = round(Int, (pk_dur_est + 1.2) / dt)
-    late_trace = trace[late_trace_start:min(late_trace_end, end)]
-    calculated_RMP = isempty(early_trace) ? trace[1] : minimum(early_trace) + 
-          (maximum(late_trace) - minimum(late_trace)) / 2
+    # RMP is the mean of the pre-stimulus baseline (first 2 ms of the recording).
+    # This is more robust than a derived formula and avoids aliasing with the
+    # AP upstroke or afterhyperpolarization.
+    baseline_end_idx = min(round(Int, 2.0 / dt), length(trace))
+    early_trace      = trace[1:baseline_end_idx]
+    calculated_RMP   = isempty(early_trace) ? trace[1] : mean(early_trace)
 
-    # Unconditionally overwrite the RMP from the config file with the
-    # value calculated from the data. This ensures the model ALWAYS starts
-    # with the data-driven RMP.
-    params = merge(initial_params, (RMP = calculated_RMP,))
-    
-    # The rest of the constructor uses this corrected `params` object
-    V_init = params.RMP
+    params    = merge(initial_params, (RMP = calculated_RMP,))
+    V_init    = params.RMP
     start_idx = round(Int, stabil_time / dt) + 1
-    end_idx = start_idx + length(trace) - 1
-    AP_val = fill(params.RMP, length(t_sim))
-    AP_val[start_idx:end_idx] = trace
-    
+    end_idx   = start_idx + length(trace) - 1
+    AP_val    = fill(params.RMP, length(t_sim))
+    AP_val[start_idx:min(end_idx, length(AP_val))] = trace[1:min(length(trace), length(AP_val) - start_idx + 1)]
+
     ap = ActionPotential(
         name, params, trace, collect(t_sim), dt,
-        0.64, 54.874, 2.0, # stim defaults
+        0.64, 54.874, 2.0,      # stim_d, stim_h, stim_dim defaults
         stabil_time, stabil_time, # stabil_time, tot_wait
         V_init,
         zeros(length(t_sim)), AP_val
     )
-
     update_model!(ap, ap.params)
     return ap
 end
 
-# Helper function to get detailed state variables from a simulation
-# This is needed for the detailed plots below.
+# ---------------------------------------------------------------------------
+# Detailed state extraction (for decomposition plots)
+# ---------------------------------------------------------------------------
 function get_full_trace_details(ap::ActionPotential)
-    p = merge(ap.params, (stim_d=ap.stim_d, stim_h=ap.stim_h, stim_dim=ap.stim_dim, tot_wait=ap.tot_wait))
-    u0 = @SVector [ap.V_init, 
-            infty_n(ap.V_init, p), 
-            infty_m(ap.V_init, p), 
-            infty_h(ap.V_init, p)]
+    p  = merge(ap.params, (stim_d=ap.stim_d, stim_h=ap.stim_h,
+                            stim_dim=ap.stim_dim, tot_wait=ap.tot_wait))
+    u0 = @SVector [ap.V_init,
+                   infty_n(ap.V_init, p),
+                   infty_m(ap.V_init, p),
+                   infty_h(ap.V_init, p)]
     tspan = (ap.time_points[1], ap.time_points[end])
-    prob = ODEProblem(hodgkin_huxley, u0, tspan, p)
-    stim_on_time = p.tot_wait; stim_off_time = p.tot_wait + p.stim_d
-    sol = solve(prob, Rosenbrock23(), saveat=ap.dt, tstops=[stim_on_time, stim_off_time])
+    prob  = ODEProblem(hodgkin_huxley, u0, tspan, p)
+    sol   = solve(prob, Rosenbrock23(), saveat=ap.dt,
+                  tstops=[p.tot_wait, p.tot_wait + p.stim_d])
 
-    # Unpack solution
-    V = [u[1] for u in sol.u]
-    n = [u[2] for u in sol.u]
-    m = [u[3] for u in sol.u]
-    h = [u[4] for u in sol.u]
-    
-    # Recalculate currents and conductances
-    E_K = nernst(1, 5.4, 143)
+    V  = [u[1] for u in sol.u]
+    n  = [u[2] for u in sol.u]
+    m  = [u[3] for u in sol.u]
+    h  = [u[4] for u in sol.u]
+
+    E_K  = nernst(1, 5.4, 143)
     E_Na = nernst(1, 145, 9.6)
-    IKs = p.g_K .* (n.^4) .* (V .- E_K)
-    INas = p.g_Na .* (m.^3) .* h .* (V .- E_Na)
-    ILeaks = p.g_Leak .* (V .- p.RMP)
-    Istims = [p.tot_wait < t < p.tot_wait+p.stim_d ? p.stim_h*((t-p.tot_wait)/p.stim_d)^p.stim_dim : 0.0 for t in ap.time_points]
-    
-    gKs = p.g_K .* (n.^4)
-    gNas = p.g_Na .* (m.^3) .* h
+    IKs    = p.g_K   .* (n.^4)       .* (V .- E_K)
+    INas   = p.g_Na  .* (m.^3) .* h  .* (V .- E_Na)
+    ILeaks = p.g_Leak             .* (V .- p.RMP)
+    Istims = [p.tot_wait < t < p.tot_wait+p.stim_d ?
+              stim_function(t-p.tot_wait, p.stim_d, p.stim_h, p.stim_dim) : 0.0
+              for t in ap.time_points]
+    gKs    = p.g_K  .* (n.^4)
+    gNas   = p.g_Na .* (m.^3) .* h
 
-    return (t=ap.time_points, V=V, IKs=IKs, INas=INas, ILeaks=ILeaks, Istims=Istims, gKs=gKs, gNas=gNas)
+    return (t=ap.time_points, V=V, n=n, m=m, h=h,
+            IKs=IKs, INas=INas, ILeaks=ILeaks, Istims=Istims,
+            gKs=gKs, gNas=gNas)
 end
 
-# --- Model Methods ---
+# ---------------------------------------------------------------------------
+# AP feature extraction
+#
+# Features are computed from the *simulated* trace (ap.Vs) by default, or
+# from the experimental trace (ap.AP_val) when use_experimental=true.
+# All times are relative to the stimulus onset (ap.tot_wait).
+#
+# Key features for group discrimination and g_Na validation:
+#   max_dvdt   — maximum upstroke velocity (mV/ms); directly proportional to
+#                peak Na current: I_Na_peak ≈ C_m * max(dV/dt)
+#   V_peak     — peak depolarisation (mV)
+#   V_threshold — membrane voltage at max dV/dt (threshold for AP firing)
+#   APD50      — action potential duration at 50% repolarisation (ms)
+#   AHP_depth  — afterhyperpolarisation below RMP (mV; negative = below rest)
+# ---------------------------------------------------------------------------
+function extract_ap_features(ap::ActionPotential; use_experimental::Bool=false)
+    V_full = use_experimental ? ap.AP_val : ap.Vs
+    t      = ap.time_points
+    dt     = ap.dt
 
-# Update the model trace based on parameters
+    # Index range: from stimulus onset to end of experimental trace
+    stim_idx  = round(Int, ap.tot_wait  / dt) + 1
+    trace_end = round(Int, (ap.stabil_time + length(ap.trace_data) * dt) / dt) + 1
+    trace_end = min(trace_end, length(V_full))
+
+    if stim_idx >= trace_end
+        @warn "extract_ap_features: stimulus onset index ≥ trace end; returning nothing"
+        return nothing
+    end
+
+    V_seg = V_full[stim_idx:trace_end]
+    t_seg = t[stim_idx:trace_end]
+    rmp   = ap.params.RMP
+
+    # Peak
+    peak_idx   = argmax(V_seg)
+    V_peak     = V_seg[peak_idx]
+    t_peak     = t_seg[peak_idx] - t_seg[1]
+    AP_amplitude = V_peak - rmp
+
+    AP_amplitude <= 0 && return nothing  # no AP fired
+
+    # Maximum upstroke dV/dt and threshold voltage
+    dVdt           = diff(V_seg) ./ dt
+    max_dvdt_idx   = argmax(dVdt)
+    max_dvdt       = dVdt[max_dvdt_idx]
+    t_threshold    = t_seg[max_dvdt_idx] - t_seg[1]
+    V_threshold    = V_seg[max_dvdt_idx]
+
+    # APD50: duration at half-amplitude above RMP
+    V_half = rmp + AP_amplitude / 2.0
+    rising_cross = findfirst(V_seg .>= V_half)
+    # Search for falling crossing only after the peak
+    fall_offset  = findfirst(@view(V_seg[peak_idx:end]) .<= V_half)
+    APD50 = (!isnothing(rising_cross) && !isnothing(fall_offset)) ?
+            (peak_idx + fall_offset - 1 - rising_cross) * dt : NaN
+
+    # Afterhyperpolarisation (AHP): minimum voltage after peak, relative to RMP
+    AHP_depth = peak_idx < length(V_seg) ?
+                minimum(V_seg[peak_idx:end]) - rmp : NaN
+
+    return (
+        RMP          = rmp,
+        V_peak       = V_peak,
+        AP_amplitude = AP_amplitude,
+        t_peak_ms    = t_peak,
+        V_threshold  = V_threshold,
+        t_threshold_ms = t_threshold,
+        max_dvdt     = max_dvdt,
+        APD50        = APD50,
+        AHP_depth    = AHP_depth
+    )
+end
+
+# ---------------------------------------------------------------------------
+# Profile likelihood for g_Na
+#
+# Fixes g_Na at n_points values spanning gNa_range × current estimate, and
+# minimises the score over all other optimised parameters at each fixed value.
+# The resulting score-vs-g_Na curve is the profile likelihood.
+#
+# A narrow, well-defined minimum confirms g_Na is identifiable from the trace.
+# A flat profile indicates g_Na cannot be reliably estimated.
+# ---------------------------------------------------------------------------
+function profile_likelihood_gNa(ap::ActionPotential, opt_param_names::Tuple;
+                                  n_points::Int  = 25,
+                                  gNa_range      = (0.3, 3.0),
+                                  bounds::Union{NamedTuple,Nothing} = nothing)
+    println("Computing profile likelihood for g_Na ($n_points points)...")
+    current_gNa = ap.params.g_Na
+    gNa_values  = collect(LinRange(current_gNa * gNa_range[1],
+                                   current_gNa * gNa_range[2], n_points))
+
+    remaining = Tuple(p for p in opt_param_names if p != :g_Na)
+    static_data = (
+        time_points    = ap.time_points,
+        dt             = ap.dt,
+        experimental_trace = ap.AP_val,
+        stim_d         = ap.stim_d,
+        stim_h         = ap.stim_h,
+        stim_dim       = ap.stim_dim,
+        tot_wait       = ap.tot_wait,
+        stabil_time    = ap.stabil_time,
+        trace_data_len = length(ap.trace_data)
+    )
+
+    profile_scores = Vector{Float64}(undef, n_points)
+    for (i, gNa_fixed) in enumerate(gNa_values)
+        fixed_p = merge(ap.params, (g_Na = gNa_fixed,))
+        function obj(p_vec)
+            iter_p = merge(fixed_p, static_data, (; zip(remaining, p_vec)...))
+            score  = _calculate_score(iter_p, static_data.time_points, static_data.dt,
+                                      static_data.experimental_trace,
+                                      static_data.stabil_time, static_data.trace_data_len)
+            if !isnothing(bounds)
+                score += _bounds_penalty(p_vec, remaining, bounds)
+            end
+            return score
+        end
+        init_vec = [fixed_p[k] for k in remaining]
+        res      = optimize(obj, init_vec, NelderMead(),
+                            Optim.Options(iterations=2000, f_reltol=1e-8))
+        profile_scores[i] = Optim.minimum(res)
+        @printf("  g_Na = %6.1f mS/cm²: score = %.4g\n", gNa_fixed, profile_scores[i])
+    end
+
+    best_idx = argmin(profile_scores)
+    return (
+        gNa_values   = gNa_values,
+        scores       = profile_scores,
+        optimal_gNa  = gNa_values[best_idx],
+        optimal_score = profile_scores[best_idx]
+    )
+end
+
+# ---------------------------------------------------------------------------
+# Model update (resimulate with current parameters)
+# ---------------------------------------------------------------------------
 function update_model!(ap::ActionPotential, params::NamedTuple)
     ap.params = params
-    # The full parameter set for simulation includes stimulus parameters
-    sim_params = merge(params, (stim_d=ap.stim_d, stim_h=ap.stim_h, stim_dim=ap.stim_dim, tot_wait=ap.tot_wait))
+    sim_params = merge(params, (stim_d=ap.stim_d, stim_h=ap.stim_h,
+                                stim_dim=ap.stim_dim, tot_wait=ap.tot_wait))
     ap.Vs = _simulate_trace(sim_params, ap.time_points, ap.dt)
 end
 
-# Find the shape of the foot of the action potential
+# ---------------------------------------------------------------------------
+# Foot-finding: constant-charge method
+# ---------------------------------------------------------------------------
 function find_foot!(ap::ActionPotential; num_fits=10)
-    println("\n--- Searching for AP foot (Constant Charge Method) ---")
-    
-    initial_params = (d=ap.stim_d, h=ap.stim_h, dim=ap.stim_dim)
-    const_integral_A = (initial_params.h * initial_params.d) / (initial_params.dim + 1)
-    @printf("Target stimulus integral (A) set to: %.4f\n", const_integral_A)
+    println("\n--- Searching for AP foot (constant-charge method) ---")
+    init_p        = (d=ap.stim_d, h=ap.stim_h, dim=ap.stim_dim)
+    const_integral = (init_p.h * init_p.d) / (init_p.dim + 1)
+    @printf("Target stimulus integral: %.4f\n", const_integral)
 
     function objective(foot_params)
         t_0, stim_d, stim_dim = foot_params
-        if t_0 < 0 || t_0 > 2.0 || stim_d < 0.1 || stim_d > 2.0 || stim_dim < 1.0; return Inf; end
-        
-        stim_h_new = const_integral_A * (stim_dim + 1) / stim_d
-        if !isfinite(stim_h_new) || stim_h_new < 0; return Inf; end
+        (t_0 < 0 || t_0 > 2.0 || stim_d < 0.1 || stim_d > 2.0 || stim_dim < 1.0) && return Inf
 
-        tot_wait = ap.stabil_time + t_0
-        start_idx = round(Int, tot_wait/ap.dt)+1; end_idx = start_idx + round(Int, stim_d/ap.dt)
-        if end_idx > length(ap.AP_val) return Inf end
-        
-        exp_trace_stim_window = ap.AP_val[start_idx:end_idx]
-        stim_integral_trace = similar(exp_trace_stim_window)
-        for (i, _) in enumerate(exp_trace_stim_window)
+        stim_h_new = const_integral * (stim_dim + 1) / stim_d
+        (!isfinite(stim_h_new) || stim_h_new < 0) && return Inf
+
+        tot_wait  = ap.stabil_time + t_0
+        start_idx = round(Int, tot_wait / ap.dt) + 1
+        end_idx   = start_idx + round(Int, stim_d / ap.dt)
+        end_idx > length(ap.AP_val) && return Inf
+
+        exp_window = ap.AP_val[start_idx:end_idx]
+        model_window = similar(exp_window)
+        for (i, _) in enumerate(exp_window)
             integral, _ = quadgk(t -> stim_function(t, stim_d, stim_h_new, stim_dim), 0, i * ap.dt)
-            stim_integral_trace[i] = integral + ap.params.RMP
+            model_window[i] = integral + ap.params.RMP
         end
-        return sum((stim_integral_trace .- exp_trace_stim_window).^2)
+        return sum((model_window .- exp_window).^2)
     end
 
-    best_result = nothing; min_value = Inf
+    best_result = nothing; min_val = Inf
     for i in 1:num_fits
-        t_0_guess=(i/num_fits)*0.5; initial_opt_params = [t_0_guess, initial_params.d, initial_params.dim]
-        result = optimize(objective, initial_opt_params, NelderMead())
-        if Optim.minimum(result) < min_value; min_value=Optim.minimum(result); best_result=result; end
+        t0_guess   = (i / num_fits) * 0.5
+        init_vec   = [t0_guess, init_p.d, init_p.dim]
+        result     = optimize(objective, init_vec, NelderMead())
+        if Optim.minimum(result) < min_val
+            min_val     = Optim.minimum(result)
+            best_result = result
+        end
     end
-    
-    best_params = Optim.minimizer(best_result)
-    t_0, stim_d, stim_dim = best_params
-    
-    ap.stim_d = stim_d
+
+    t_0, stim_d, stim_dim = Optim.minimizer(best_result)
+    ap.stim_d   = stim_d
     ap.stim_dim = stim_dim
-    ap.stim_h = const_integral_A * (stim_dim + 1) / stim_d
+    ap.stim_h   = const_integral * (stim_dim + 1) / stim_d
     ap.tot_wait = ap.stabil_time + t_0
-    
-    @printf("Foot found. Optimal t_0: %.3f ms, d: %.3f, m: %.2f, constrained h: %.2f\n", t_0, ap.stim_d, ap.stim_dim, ap.stim_h)
+    @printf("Foot: t_0=%.3f ms, d=%.3f, dim=%.2f, h=%.2f\n",
+            t_0, ap.stim_d, ap.stim_dim, ap.stim_h)
     update_model!(ap, ap.params)
 end
 
-# Standarized full optimization routine
-function optimize!(ap::ActionPotential, opt_param_names::Tuple)
-    # First, ensure the foot is found
-    find_foot!(ap)
-
-    # Stage 1: Global Search
-    global_result = global_optimize(ap, opt_param_names, max_evals=500000, range=0.9)
-    global_params = global_result["par"]
-    
-    # Update the model with the result of the global search
-    update_model!(ap, global_params)
-    
-    # Stage 2: Local Refinement
-    final_result = optimize_model(ap, opt_param_names)
-
-    update_model!(ap, final_result["par"])
-
-    return Dict("par" => final_result["par"], "value" => final_result["value"], "convergence" => final_result["convergence"])
-end
-
-# Optimization of model parameters to fit the experimental trace
-function optimize_model(ap::ActionPotential, opt_param_names::Tuple)
-    println("Starting local refinement with Optim.jl...")
-    initial_params = ap.params
-    static_data = (time_points = ap.time_points, dt = ap.dt, experimental_trace = ap.AP_val, stim_d = ap.stim_d, stim_h = ap.stim_h, stim_dim = ap.stim_dim, tot_wait = ap.tot_wait, stabil_time = ap.stabil_time, trace_data_len = length(ap.trace_data))
-
-    function objective(p_vec)
-        iter_params_subset = (; zip(opt_param_names, p_vec)...)
-        full_iter_params = merge(initial_params, static_data, iter_params_subset)
-        return _calculate_score(full_iter_params, static_data.time_points, static_data.dt, static_data.experimental_trace, static_data.stabil_time, static_data.trace_data_len)
-    end
-
-    initial_params_vec = [initial_params[k] for k in opt_param_names]
-    result = optimize(objective, initial_params_vec, NelderMead(), Optim.Options(iterations=5000, f_reltol=1e-9))
-    
-    final_p_vec = Optim.minimizer(result); final_params_subset = (;zip(opt_param_names, final_p_vec)...)
-    full_final_params = merge(initial_params, final_params_subset)
-
-    println("Local refinement finished. Best score: ", Optim.minimum(result))
-    return Dict("par" => full_final_params, "value" => Optim.minimum(result), "convergence" => Optim.converged(result))
-end
-
-# Nudge optimization: multiple fits from perturbed initial conditions in parallel
-function global_optimize(ap::ActionPotential, opt_param_names::Tuple; max_evals=2500, range=0.5)
-    println("Starting global optimization with BlackBoxOptim...")
+# ---------------------------------------------------------------------------
+# Local refinement (NelderMead + optional bounds penalty)
+# ---------------------------------------------------------------------------
+function optimize_model(ap::ActionPotential, opt_param_names::Tuple;
+                         bounds::Union{NamedTuple,Nothing} = nothing)
+    println("Starting local refinement (NelderMead)...")
     initial_params = ap.params
     static_data = (
-        time_points = ap.time_points, dt = ap.dt, experimental_trace = ap.AP_val,
-        stim_d = ap.stim_d, stim_h = ap.stim_h, stim_dim = ap.stim_dim, tot_wait = ap.tot_wait,
-        stabil_time = ap.stabil_time, trace_data_len = length(ap.trace_data)
+        time_points    = ap.time_points,
+        dt             = ap.dt,
+        experimental_trace = ap.AP_val,
+        stim_d         = ap.stim_d,
+        stim_h         = ap.stim_h,
+        stim_dim       = ap.stim_dim,
+        tot_wait       = ap.tot_wait,
+        stabil_time    = ap.stabil_time,
+        trace_data_len = length(ap.trace_data)
     )
 
     function objective(p_vec)
-        iter_params_subset = (; zip(opt_param_names, p_vec)...)
-        full_iter_params = merge(initial_params, static_data, iter_params_subset)
-        return _calculate_score(full_iter_params, static_data.time_points, static_data.dt, static_data.experimental_trace, static_data.stabil_time, static_data.trace_data_len)
+        iter_p = merge(initial_params, static_data, (; zip(opt_param_names, p_vec)...))
+        score  = _calculate_score(iter_p, static_data.time_points, static_data.dt,
+                                  static_data.experimental_trace,
+                                  static_data.stabil_time, static_data.trace_data_len)
+        if !isnothing(bounds)
+            score += _bounds_penalty(p_vec, opt_param_names, bounds)
+        end
+        return score
     end
 
-    # Define the search space for the optimizer using the new `range` parameter
-    search_range = Tuple{Float64, Float64}[];
-    for name in opt_param_names
-        val = initial_params[name]
-        # Use the `range` argument to define the search window
-        lower_bound = val > 0 ? val * (1.0 - range) : val * (1.0 + range)
-        upper_bound = val > 0 ? val * (1.0 + range) : val * (1.0 - range)
-        if lower_bound > upper_bound; lower_bound, upper_bound = upper_bound, lower_bound; end
-        push!(search_range, (lower_bound, upper_bound))
-    end
-    
-    result = bboptimize(objective; 
-                        SearchRange = search_range,
-                        NumDimensions = length(opt_param_names),
-                        MaxFuncEvals = max_evals,
-                        TraceMode = :silent)
-    
-    final_p_vec = best_candidate(result)
-    final_params_subset = (;zip(opt_param_names, final_p_vec)...)
-    full_final_params = merge(initial_params, final_params_subset)
+    init_vec = [initial_params[k] for k in opt_param_names]
+    result   = optimize(objective, init_vec, NelderMead(),
+                        Optim.Options(iterations=5000, f_reltol=1e-9))
 
-    println("Global optimization finished. Best score: ", best_fitness(result))
-    return Dict("par" => full_final_params, "value" => best_fitness(result))
+    final_vec    = Optim.minimizer(result)
+    final_subset = (; zip(opt_param_names, final_vec)...)
+    full_params  = merge(initial_params, final_subset)
+
+    println("Local refinement complete. Best score: ", Optim.minimum(result))
+    return Dict("par" => full_params, "value" => Optim.minimum(result),
+                "convergence" => Optim.converged(result))
 end
 
-# Use the GPU to accelerate the simulation (if available)
-function gpu_grid_search!(ap::ActionPotential, opt_param_names::Tuple; num_trajectories=10000, range=0.5)
-    println("Starting GPU-based grid search with $(num_trajectories) parameter sets...")
-
-    # --- Setup
+# ---------------------------------------------------------------------------
+# Global search (BlackBoxOptim)
+# ---------------------------------------------------------------------------
+function global_optimize(ap::ActionPotential, opt_param_names::Tuple;
+                          max_evals=2500, range=0.5,
+                          bounds::Union{NamedTuple,Nothing} = nothing)
+    println("Starting global search (BlackBoxOptim, max_evals=$max_evals)...")
     initial_params = ap.params
-    dt = ap.dt
-    time_points = ap.time_points
+    static_data = (
+        time_points    = ap.time_points,
+        dt             = ap.dt,
+        experimental_trace = ap.AP_val,
+        stim_d         = ap.stim_d,
+        stim_h         = ap.stim_h,
+        stim_dim       = ap.stim_dim,
+        tot_wait       = ap.tot_wait,
+        stabil_time    = ap.stabil_time,
+        trace_data_len = length(ap.trace_data)
+    )
+
+    function objective(p_vec)
+        iter_p = merge(initial_params, static_data, (; zip(opt_param_names, p_vec)...))
+        return _calculate_score(iter_p, static_data.time_points, static_data.dt,
+                                static_data.experimental_trace,
+                                static_data.stabil_time, static_data.trace_data_len)
+    end
+
+    # Use physiological bounds when supplied; otherwise ±range% of initial value.
+    search_range = Tuple{Float64, Float64}[]
+    for name in opt_param_names
+        if !isnothing(bounds) && haskey(bounds, name)
+            push!(search_range, bounds[name])
+        else
+            val = initial_params[name]
+            lb  = val > 0 ? val * (1 - range) : val * (1 + range)
+            ub  = val > 0 ? val * (1 + range) : val * (1 - range)
+            lb > ub && ((lb, ub) = (ub, lb))
+            push!(search_range, (lb, ub))
+        end
+    end
+
+    result    = bboptimize(objective;
+                           SearchRange  = search_range,
+                           NumDimensions = length(opt_param_names),
+                           MaxFuncEvals = max_evals,
+                           TraceMode    = :silent)
+    final_vec = best_candidate(result)
+    full_params = merge(initial_params, (; zip(opt_param_names, final_vec)...))
+    println("Global search complete. Best score: ", best_fitness(result))
+    return Dict("par" => full_params, "value" => best_fitness(result))
+end
+
+# ---------------------------------------------------------------------------
+# Full two-stage optimisation pipeline
+# ---------------------------------------------------------------------------
+function optimize!(ap::ActionPotential, opt_param_names::Tuple;
+                   bounds::Union{NamedTuple,Nothing} = nothing)
+    find_foot!(ap)
+
+    global_result = global_optimize(ap, opt_param_names;
+                                    max_evals=500000, range=0.9, bounds=bounds)
+    update_model!(ap, global_result["par"])
+
+    final_result  = optimize_model(ap, opt_param_names; bounds=bounds)
+    update_model!(ap, final_result["par"])
+
+    return Dict("par" => final_result["par"], "value" => final_result["value"],
+                "convergence" => final_result["convergence"])
+end
+
+# ---------------------------------------------------------------------------
+# GPU grid search (requires CUDA)
+# ---------------------------------------------------------------------------
+function gpu_grid_search!(ap::ActionPotential, opt_param_names::Tuple;
+                           num_trajectories=10000, range=0.5)
+    println("Starting GPU grid search ($num_trajectories trajectories)...")
+    initial_params = ap.params
+    dt             = ap.dt
+    time_points    = ap.time_points
     experimental_trace = ap.AP_val
 
-    # Generate Sobol samples for parameters
-    opt_params_subset = NamedTuple(k => initial_params[k] for k in opt_param_names)
-    s = SobolSeq(length(opt_params_subset))
+    opt_subset = NamedTuple(k => initial_params[k] for k in opt_param_names)
+    s          = SobolSeq(length(opt_subset))
     param_sets = Vector{NamedTuple}(undef, num_trajectories)
     for i in 1:num_trajectories
-        p_factors = next!(s) .* (2 * range) .+ (1.0 - range)
-        p_vec = values(opt_params_subset) .* p_factors
-        param_sets[i] = (; zip(keys(opt_params_subset), p_vec)...)
+        p_factors   = next!(s) .* (2 * range) .+ (1.0 - range)
+        p_vec       = values(opt_subset) .* p_factors
+        param_sets[i] = (; zip(keys(opt_subset), p_vec)...)
     end
 
-    # Template problem (only HH params, no data arrays!)
-    template_p = merge(initial_params, (stim_d=ap.stim_d, stim_h=ap.stim_h, stim_dim=ap.stim_dim, tot_wait=ap.tot_wait))
-    u0 = @SVector [ap.V_init, infty_n(ap.V_init, template_p), infty_m(ap.V_init, template_p), infty_h(ap.V_init, template_p)]
+    template_p = merge(initial_params,
+                       (stim_d=ap.stim_d, stim_h=ap.stim_h,
+                        stim_dim=ap.stim_dim, tot_wait=ap.tot_wait))
+    u0    = @SVector [ap.V_init,
+                      infty_n(ap.V_init, template_p),
+                      infty_m(ap.V_init, template_p),
+                      infty_h(ap.V_init, template_p)]
     tspan = (time_points[1], time_points[end])
-    prob = ODEProblem(hodgkin_huxley, u0, tspan, template_p)
+    prob  = ODEProblem(hodgkin_huxley, u0, tspan, template_p)
 
-    # Define how to remake each problem for different param sets
     function prob_func(prob, i, repeat)
-        iter_params = merge(template_p, param_sets[i])
-        u0 = @SVector [iter_params.RMP, infty_n(iter_params.RMP, iter_params),
-                       infty_m(iter_params.RMP, iter_params),
-                       infty_h(iter_params.RMP, iter_params)]
-        remake(prob, u0=u0, p=iter_params)
+        iter_p = merge(template_p, param_sets[i])
+        u0_i   = @SVector [iter_p.RMP,
+                            infty_n(iter_p.RMP, iter_p),
+                            infty_m(iter_p.RMP, iter_p),
+                            infty_h(iter_p.RMP, iter_p)]
+        remake(prob, u0=u0_i, p=iter_p)
     end
 
-    # Score function directly from GPU solution
     function output_func(sol, i)
-        if sol.retcode != :Success
-            return Inf
-        end
-        simV = [u[1] for u in sol.u]
-        return _calculate_score(sol.prob.p, time_points, dt, experimental_trace,
-                                ap.stabil_time, length(ap.trace_data))
+        sol.retcode != :Success && return Inf
+        _calculate_score(sol.prob.p, time_points, dt, experimental_trace,
+                         ap.stabil_time, length(ap.trace_data))
     end
 
-    # Ensemble setup
     ensemble_prob = EnsembleProblem(prob; prob_func=prob_func, output_func=output_func,
                                     reduction=(u, data, I) -> (min(u, data), false))
+    sol = solve(ensemble_prob, GPUTsit5(),
+                DiffEqGPU.EnsembleGPUKernel(CUDABackend());
+                trajectories=num_trajectories, saveat=dt)
 
-    # GPU solve
-    sol = solve(ensemble_prob,
-            GPUTsit5(),
-            DiffEqGPU.EnsembleGPUKernel(CUDABackend());
-            trajectories=num_trajectories,
-            saveat=dt)
-
-    best_score = sol.u  # reduction stores the min score here
-    println("GPU grid search finished. Best score: ", best_score)
-
-    # Find the params corresponding to that score (brute force search on CPU side)
-    scores = [output_func(solve(prob_func(prob, i, 0), RK4(), dt=dt), i) for i in 1:num_trajectories]
-    best_idx = argmin(scores)
-    best_params_subset = param_sets[best_idx]
-    full_final_params = merge(initial_params, best_params_subset)
-
-    return Dict("par" => full_final_params, "value" => best_score)
+    best_score = sol.u
+    scores     = [output_func(solve(prob_func(prob, i, 0), RK4(), dt=dt), i)
+                  for i in 1:num_trajectories]
+    best_idx   = argmin(scores)
+    full_params = merge(initial_params, param_sets[best_idx])
+    println("GPU grid search complete. Best score: ", best_score)
+    return Dict("par" => full_params, "value" => best_score)
 end
 
-#--- Visualization ---
-
+# ---------------------------------------------------------------------------
+# Visualisation
+# ---------------------------------------------------------------------------
 function create_ap_plot(ap::ActionPotential)
-    p = plot(ap.time_points, ap.Vs, 
-             label="Model Trace", 
-             lw=2, 
-             title=ap.name, 
-             xlabel="Time (ms)", 
-             ylabel="Voltage (mV)",
-             legend=:topleft)
-    
-    # The experimental data always starts after the fixed stabilization time.
-    start_time_data = ap.stabil_time
-    end_time_data = start_time_data + (length(ap.trace_data) - 1) * ap.dt
-    experimental_time = start_time_data:ap.dt:end_time_data
+    p = plot(ap.time_points, ap.Vs,
+             label     = "Model",
+             lw        = 2,
+             title     = ap.name,
+             xlabel    = "Time (ms)",
+             ylabel    = "Voltage (mV)",
+             legend    = :topleft)
 
-    if length(experimental_time) > length(ap.trace_data)
-        experimental_time = experimental_time[1:length(ap.trace_data)]
+    start_time = ap.stabil_time
+    end_time   = start_time + (length(ap.trace_data) - 1) * ap.dt
+    exp_time   = collect(start_time:ap.dt:end_time)
+    if length(exp_time) > length(ap.trace_data)
+        exp_time = exp_time[1:length(ap.trace_data)]
     end
-    
-    # Plot the experimental data at its fixed, correct location
-    plot!(p, experimental_time, ap.trace_data, label="Experimental Data", ls=:dash, color=:red)
-    
-    # The stimulus trace correctly uses the optimized 'tot_wait'
-    stim_trace = zeros(length(ap.time_points))
-    for (i, t) in enumerate(ap.time_points)
-        if ap.tot_wait < t < ap.tot_wait + ap.stim_d
-            stim_trace[i] = ap.stim_h * ((t - ap.tot_wait) / ap.stim_d)^ap.stim_dim
-        end
-    end
-    
+    plot!(p, exp_time, ap.trace_data,
+          label = "Experimental", ls = :dash, color = :red)
+
+    stim_trace = [ap.tot_wait < t < ap.tot_wait + ap.stim_d ?
+                  ap.stim_h * ((t - ap.tot_wait) / ap.stim_d)^ap.stim_dim : 0.0
+                  for t in ap.time_points]
     p_twin = twinx(p)
-    plot!(p_twin, ap.time_points,
-        stim_trace, 
-        label="Stimulus Current", 
-        color=:green, 
-        ls=:dot, 
-        lw=2, 
-        ylabel="Current (μA/cm²)", 
-        legend=:topright
-    )
-    
+    plot!(p_twin, ap.time_points, stim_trace,
+          label   = "Stimulus",
+          color   = :green,
+          ls      = :dot,
+          lw      = 2,
+          ylabel  = "Current (μA/cm²)",
+          legend  = :topright)
     return p
 end
 
-# Display the action potential trace with experimental data overlay
 function display_action_potential(ap::ActionPotential)
-    p = create_ap_plot(ap)
-    display(p)
+    display(create_ap_plot(ap))
 end
 
-end # end module
+end # module ActionPotentialModel
