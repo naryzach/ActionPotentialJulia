@@ -54,7 +54,16 @@ infty_m(V, p) = alpha_m(V, p) / (alpha_m(V, p) + beta_m(V, p))
 infty_h(V, p) = alpha_h(V, p) / (alpha_h(V, p) + beta_h(V, p))
 
 # Power-law stimulus that rises from 0 to stim_h over duration stim_d.
-stim_function(t, stim_d, stim_h, stim_dim) = stim_h * (t / stim_d)^stim_dim
+# Clamped to 0 for t ≤ 0 — raising a negative base to a Float64 exponent
+# (even an integer-valued one like 2.0) causes a DomainError in Julia.
+stim_function(t, stim_d, stim_h, stim_dim) =
+    t <= 0.0 ? 0.0 : stim_h * (t / stim_d)^stim_dim
+
+# Analytical integral of stim_function from 0 to T:
+#   ∫₀ᵀ stim_h·(t/d)^dim dt  =  stim_h·d/(dim+1)·(T/d)^(dim+1)
+# Used in find_foot! in place of quadgk — exact, fast, and domain-safe.
+stim_integral(T, stim_d, stim_h, stim_dim) =
+    T <= 0.0 ? 0.0 : stim_h * stim_d / (stim_dim + 1) * (T / stim_d)^(stim_dim + 1)
 
 # ---------------------------------------------------------------------------
 # Hodgkin-Huxley ODE system
@@ -430,8 +439,7 @@ function find_foot!(ap::ActionPotential; num_fits=10)
         exp_window = ap.AP_val[start_idx:end_idx]
         model_window = similar(exp_window)
         for (i, _) in enumerate(exp_window)
-            integral, _ = quadgk(t -> stim_function(t, stim_d, stim_h_new, stim_dim), 0, i * ap.dt)
-            model_window[i] = integral + ap.params.RMP
+            model_window[i] = stim_integral(i * ap.dt, stim_d, stim_h_new, stim_dim) + ap.params.RMP
         end
         return sum((model_window .- exp_window).^2)
     end
