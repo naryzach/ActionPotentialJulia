@@ -9,46 +9,12 @@
 #   GPU mode  — map runs fits sequentially on the main process; the GPU
 #               ensemble provides parallelism per fit.
 
-using Distributed
-if nprocs() < 4; addprocs(max(1, 4 - nprocs())); end
-
-@everywhere include("config.jl")
-@everywhere include("ActionPotential.jl")
-
 using .ActionPotentialModel
 using CSV, DataFrames, Printf, Dates, Sobol, MixedModels, CategoricalArrays
 using Plots, StatsPlots, Statistics
 
 # Parameters optimised in the group workflow (RMP included — free within bounds)
-@everywhere const opt_par_group_names = (:N_6, :N_7, :M_6, :M_7, :M_1, :M_2, :g_Na, :g_K, :RMP)
-
-# ---------------------------------------------------------------------------
-# Top-level worker function (must be defined outside any other function to
-# avoid Julia 1.12 world-age errors when called from distributed workers).
-# ---------------------------------------------------------------------------
-@everywhere function run_group_fit(task)
-    tbl, grp, indiv, seed_p, bounds, trace, time, opn, use_gpu, num_traj = task
-    redirect_stdout(devnull) do
-        ap     = ActionPotentialModel.ActionPotential(seed_p, trace, time,
-                                                      name="T$tbl-G$grp-I$indiv")
-        result = ActionPotentialModel.optimize!(ap, opn; bounds=bounds,
-                                                use_gpu=use_gpu, num_trajectories=num_traj)
-        feats  = ActionPotentialModel.extract_ap_features(ap)
-
-        res = Dict{Symbol, Any}(pairs(result["par"]))
-        res[:tbl]      = tbl
-        res[:group_id] = grp
-        res[:indiv]    = indiv
-        res[:score]    = result["value"]
-
-        if !isnothing(feats)
-            for (k, v) in pairs(feats)
-                res[Symbol("feat_", k)] = v
-            end
-        end
-        return res
-    end
-end
+const opt_par_group_names = (:N_6, :N_7, :M_6, :M_7, :M_1, :M_2, :g_Na, :g_K, :RMP)
 
 # ---------------------------------------------------------------------------
 # Generate a table of Sobol-randomised starting values for the *fixed*

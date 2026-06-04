@@ -6,6 +6,9 @@ using DifferentialEquations, Optim, Plots, Printf, Statistics
 using Sobol, DataFrames, CSV, Distributed
 using QuadGK, StaticArrays, BlackBoxOptim
 using CUDA, DiffEqGPU
+# successful_retcode is reexported by DifferentialEquations (defined in SciMLBase).
+# Use it instead of `retcode == :Success`: retcode is now a ReturnCode.T enum,
+# so comparing it to the Symbol :Success is ALWAYS false (silently breaks solves).
 
 export ActionPotential, optimize!, display_action_potential,
        extract_ap_features, profile_likelihood_gNa,
@@ -54,7 +57,18 @@ infty_m(V, p) = alpha_m(V, p) / (alpha_m(V, p) + beta_m(V, p))
 infty_h(V, p) = alpha_h(V, p) / (alpha_h(V, p) + beta_h(V, p))
 
 # Power-law stimulus that rises from 0 to stim_h over duration stim_d.
-stim_function(t, stim_d, stim_h, stim_dim) = stim_h * (t / stim_d)^stim_dim
+# Clamped to 0 for t ≤ 0 — raising a negative base to a Float64 exponent
+# (even an integer-valued one like 2.0) causes a DomainError in Julia.
+stim_function(t, stim_d, stim_h, stim_dim) =
+    (t <= 0.0 || stim_d <= 0.0) ? 0.0 : stim_h * (t / stim_d)^stim_dim
+
+# Analytical integral of stim_function from 0 to T:
+#   ∫₀ᵀ stim_h·(t/d)^dim dt  =  stim_h·d/(dim+1)·(T/d)^(dim+1)
+# Guards against stim_d ≤ 0: NelderMead's simplex reflection/contraction
+# arithmetic can produce negative stim_d even from valid simplex vertices.
+stim_integral(T, stim_d, stim_h, stim_dim) =
+    (T <= 0.0 || stim_d <= 0.0) ? 0.0 :
+    stim_h * stim_d / (stim_dim + 1) * (T / stim_d)^(stim_dim + 1)
 
 # ---------------------------------------------------------------------------
 # Hodgkin-Huxley ODE system
@@ -99,7 +113,7 @@ function _simulate_trace(params::NamedTuple, time_points::Vector{Float64}, dt::F
                 saveat = dt, reltol = 1e-4, abstol = 1e-4,
                 tstops = [stim_on, stim_off])
 
-    if sol.retcode != :Success || length(sol.u) != length(time_points)
+    if !successful_retcode(sol) || length(sol.u) != length(time_points)
         return fill(Inf, length(time_points))
     end
     return [v[1] for v in sol.u]
@@ -417,28 +431,36 @@ function find_foot!(ap::ActionPotential; num_fits=10)
 
     function objective(foot_params)
         t_0, stim_d, stim_dim = foot_params
-        (t_0 < 0 || t_0 > 2.0 || stim_d < 0.1 || stim_d > 2.0 || stim_dim < 1.0) && return Inf
+        # Explicit if is more reliable than && in closures called via Optim internals.
+        if t_0 < 0 || t_0 > 2.0 || stim_d <= 0.0 || stim_d > 2.0 || stim_dim < 1.0
+            return Inf
+        end
 
         stim_h_new = const_integral * (stim_dim + 1) / stim_d
-        (!isfinite(stim_h_new) || stim_h_new < 0) && return Inf
+        if !isfinite(stim_h_new) || stim_h_new < 0
+            return Inf
+        end
 
         tot_wait  = ap.stabil_time + t_0
         start_idx = round(Int, tot_wait / ap.dt) + 1
         end_idx   = start_idx + round(Int, stim_d / ap.dt)
-        end_idx > length(ap.AP_val) && return Inf
+        if end_idx > length(ap.AP_val)
+            return Inf
+        end
 
-        exp_window = ap.AP_val[start_idx:end_idx]
+        exp_window   = ap.AP_val[start_idx:end_idx]
         model_window = similar(exp_window)
         for (i, _) in enumerate(exp_window)
-            integral, _ = quadgk(t -> stim_function(t, stim_d, stim_h_new, stim_dim), 0, i * ap.dt)
-            model_window[i] = integral + ap.params.RMP
+            model_window[i] = stim_integral(i * ap.dt, stim_d, stim_h_new, stim_dim) + ap.params.RMP
         end
         return sum((model_window .- exp_window).^2)
     end
 
-    # Independent fits from different starting points — run in parallel threads.
+    # Run fits sequentially — the overhead is negligible (each NelderMead run
+    # takes < 1 ms) and threading a shared closure via @threads risks Optim's
+    # internal simplex workspace being corrupted by concurrent Julia task scheduling.
     results = Vector{Any}(undef, num_fits)
-    Threads.@threads for i in 1:num_fits
+    for i in 1:num_fits
         t0_guess   = (i / num_fits) * 0.5
         results[i] = optimize(objective, [t0_guess, init_p.d, init_p.dim], NelderMead())
     end
@@ -611,7 +633,8 @@ function gpu_grid_search!(ap::ActionPotential, opt_param_names::Tuple;
     tspan = (time_points[1], time_points[end])
     prob  = ODEProblem(hodgkin_huxley, u0, tspan, template_p)
 
-    function prob_func(prob, i, repeat)
+    function prob_func(prob, ctx)
+        i      = ctx.sim_id
         iter_p = merge(template_p, param_sets[i])
         u0_i   = @SVector [iter_p.RMP,
                             infty_n(iter_p.RMP, iter_p),
@@ -626,10 +649,9 @@ function gpu_grid_search!(ap::ActionPotential, opt_param_names::Tuple;
     best_score_ref = Ref{Float64}(Inf)
     lk             = ReentrantLock()
 
-    function output_func(sol, i)
-        # Use the GPU-computed solution directly — do NOT call _simulate_trace
-        # here (that would re-solve the ODE on CPU, defeating the GPU entirely).
-        if sol.retcode != :Success || length(sol.u) != length(time_points)
+    function output_func(sol, ctx)
+        i = ctx.sim_id
+        if !successful_retcode(sol) || length(sol.u) != length(time_points)
             return (Inf, false)
         end
         simV  = [u[1] for u in sol.u]

@@ -7,42 +7,14 @@
 #   CPU mode  — pmap distributes one trace per distributed worker
 #   GPU mode  — map runs traces sequentially on the main process; the GPU
 #               ensemble (100 K+ trajectories) provides parallelism per trace.
-#               Running gpu_grid_search! inside a distributed worker causes
-#               Julia 1.12 world-age errors with DiffEqGPU closures.
-
-using Distributed
-if nprocs() < 4; addprocs(max(1, 4 - nprocs())); end
-
-@everywhere include("config.jl")
-@everywhere include("ActionPotential.jl")
+#
+# Worker functions (fit_trace, run_group_fit) live in worker_functions.jl and
+# are loaded @everywhere by main.jl AFTER workers are added — satisfying
+# Julia 1.12's rule that functions called via pmap must be defined at the
+# workers' top level.
 
 using .ActionPotentialModel
 using CSV, DataFrames, Printf, Dates, Plots
-
-# ---------------------------------------------------------------------------
-# Top-level worker function (must be defined outside any other function to
-# avoid Julia 1.12 world-age errors when called from distributed workers).
-# ---------------------------------------------------------------------------
-@everywhere function fit_trace(task)
-    p0, bounds, trace, time, name, opn, use_gpu, num_traj = task
-    redirect_stdout(devnull) do
-        ap     = ActionPotentialModel.ActionPotential(p0, trace, time, name=name)
-        result = ActionPotentialModel.optimize!(ap, opn; bounds=bounds,
-                                                use_gpu=use_gpu, num_trajectories=num_traj)
-        feats  = ActionPotentialModel.extract_ap_features(ap)
-        return (
-            name           = name,
-            params         = result["par"],
-            value          = result["value"],
-            convergence    = result["convergence"],
-            RMP            = ap.params.RMP,
-            final_stim_d   = ap.stim_d,
-            final_stim_dim = ap.stim_dim,
-            final_tot_wait = ap.tot_wait,
-            features       = feats
-        )
-    end
-end
 
 # ---------------------------------------------------------------------------
 # Per-file processing

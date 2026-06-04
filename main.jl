@@ -23,6 +23,14 @@
 
 using ArgParse, Distributed, Dates, JSON3
 
+# Load core dependencies first so workflow files can `using .ActionPotentialModel`,
+# and so worker functions (fit_trace, run_group_fit) exist in an older world than
+# the functions that call them — satisfying Julia 1.12 world-age rules.
+include("config.jl")
+include("ActionPotential.jl")
+using .ActionPotentialModel
+include("worker_functions.jl")   # defines fit_trace / run_group_fit before callers
+
 include("workflow_read_traces.jl")
 include("workflow_group_trace.jl")
 include("workflow_report.jl")
@@ -86,7 +94,7 @@ function main()
     end
 
     if workflow in ["traces", "group"]
-        procs_to_add = max(0, cores - 1)
+        procs_to_add = use_gpu ? 0 : max(0, cores - 1)
         added_procs  = Int[]
 
         try
@@ -97,8 +105,11 @@ function main()
             println("Workers ready: $(nprocs()) total.  Julia threads: $(Threads.nthreads())")
 
             @everywhere begin
-                include("config.jl")
-                include("ActionPotential.jl")
+                # Guards prevent double-loading on the main process; workers
+                # always hit all three includes since they start with a clean slate.
+                isdefined(Main, :par_0)              || include("config.jl")
+                isdefined(Main, :ActionPotentialModel) || include("ActionPotential.jl")
+                isdefined(Main, :fit_trace)            || include("worker_functions.jl")
             end
             println("Code loaded on all processes.")
 
