@@ -12,6 +12,9 @@
 using .ActionPotentialModel
 using CSV, DataFrames, Printf, Dates, Sobol, MixedModels, CategoricalArrays
 using Plots, StatsPlots, Statistics
+# Qualified import only — ProgressMeter exports next!/update!, which would
+# otherwise clash with Sobol.next! (used in get_fixed_parameter_sets).
+import ProgressMeter
 
 # Parameters optimised in the group workflow (RMP included — free within bounds)
 const opt_par_group_names = (:N_6, :N_7, :M_6, :M_7, :M_1, :M_2, :g_Na, :g_K, :RMP)
@@ -73,71 +76,114 @@ function main_group_trace(; use_gpu::Bool=false, num_trajectories::Int=100_000)
 
     println("Running $(length(tasks)) fits across $num_tables tables...")
     # GPU: run on main process — see comment in workflow_read_traces.jl.
-    # CPU: distribute via pmap.
-    all_results = use_gpu ? map(run_group_fit, tasks) : pmap(run_group_fit, tasks)
+    # CPU: distribute via pmap.  Live bar + ETA over all fits.
+    prog        = ProgressMeter.Progress(length(tasks); desc="  Group fits ", showspeed=true)
+    ProgressMeter.update!(prog, 0)   # render the bar immediately at 0%
+    all_results = use_gpu ? ProgressMeter.progress_map(run_group_fit, tasks; progress=prog) :
+                            ProgressMeter.progress_pmap(run_group_fit, tasks; progress=prog)
     sim_data    = DataFrame(all_results)
     sim_data.group = [group_names[id] for id in sim_data.group_id]
 
     CSV.write(joinpath(latest_dir, "All_sim_data.csv"), sim_data)
     println("Full data saved.")
 
-    # --- Summary plots ---
+    # --- Summary plots (robust to NaN/missing: some features, e.g. APD50/AHP,
+    #     are NaN when their voltage crossings are not found) ---
     println("Generating parameter boxplots...")
-    for param in opt_par_group_names
-        p_box = @df sim_data boxplot(:group, cols(param), group=:group,
-                                      legend=false, title="$(param) by group")
-        savefig(p_box, joinpath(latest_dir, "boxplot_$(param).png"))
+    param_cols = collect(opt_par_group_names)
+    feat_cols  = [Symbol(c) for c in names(sim_data) if startswith(String(c), "feat_")]
+    for col in vcat(param_cols, feat_cols)
+        sub = sim_data[.!ismissing.(sim_data[!, col]) .&
+                       isfinite.(coalesce.(sim_data[!, col], NaN)), :]
+        if nrow(sub) < 2
+            @warn "Skipping boxplot for $col (no finite data)"
+            continue
+        end
+        try
+            p = @df sub boxplot(:group, cols(col), group=:group,
+                                legend=false, title="$(col) by group")
+            savefig(p, joinpath(latest_dir, "boxplot_$(col).png"))
+        catch e
+            @warn "Boxplot failed for $col: $e"
+        end
     end
 
-    feat_cols = [c for c in names(sim_data) if startswith(String(c), "feat_")]
-    for feat in feat_cols
-        p_feat = @df sim_data boxplot(:group, cols(Symbol(feat)), group=:group,
-                                       legend=false, title="$(feat) by group")
-        savefig(p_feat, joinpath(latest_dir, "boxplot_$(feat).png"))
-    end
-
-    # Average-parameter trace overlay
-    avg = combine(groupby(sim_data, :group), names(sim_data, Real) .=> mean)
-    rename!(avg, Dict(old => Symbol(replace(String(old), "_mean" => ""))
-                      for old in names(avg)))
-
+    # Average-parameter trace overlay (group means over finite values only)
     p_avg = plot(title="Average Fitted AP by Group",
                  xlabel="Time (ms)", ylabel="Voltage (mV)")
     dummy_time  = collect(0.0:0.02:20.0)
     dummy_trace = fill(-70.0, length(dummy_time))
-    for row in eachrow(avg)
-        avg_ap = ActionPotentialModel.ActionPotential(NamedTuple(row), dummy_trace, dummy_time,
-                                                       name=row.group)
-        plot!(p_avg, avg_ap.time_points, avg_ap.Vs, label=row.group, lw=2)
+    for g in group_names
+        gdf = filter(r -> r.group == g, sim_data)
+        nrow(gdf) == 0 && continue
+        pmean = Dict{Symbol,Float64}()
+        for k in keys(par_0)
+            if hasproperty(gdf, k)
+                v = filter(isfinite, collect(skipmissing(gdf[!, k])))
+                pmean[k] = isempty(v) ? par_0[k] : mean(v)
+            end
+        end
+        avg_ap = ActionPotentialModel.ActionPotential(merge(par_0, NamedTuple(pmean)),
+                                                      dummy_trace, dummy_time, name=g)
+        plot!(p_avg, avg_ap.time_points, avg_ap.Vs, label=g, lw=2)
     end
     savefig(p_avg, joinpath(latest_dir, "average_traces.png"))
 
     # --- Linear mixed-effects models ---
+    # PRIMARY tests are on the model-free AP FEATURES (esp. feat_max_dvdt, the
+    # maximum upstroke velocity), which are robust, identifiable observables.
+    # Fitted conductances are reported too, but g_Na is NON-IDENTIFIABLE from the
+    # AP waveform (flat profile likelihood — see report.jmd, Critical Findings),
+    # so its group effect is unreliable and flagged accordingly.
     stats_path = joinpath(latest_dir, "statistical_summary.txt")
     println("\n--- Fitting Linear Mixed-Effects Models ---")
+
+    feat_cols = [Symbol(c) for c in names(sim_data) if startswith(String(c), "feat_")]
+    # Headline first: maximum upstroke velocity (the g_Na proxy).
+    sort!(feat_cols; by = c -> (c === :feat_max_dvdt ? "" : String(c)))
+
+    function fit_one_lmm(fh, resp)
+        println("\n--- $resp ---")
+        println(fh, "\n" * "="^60)
+        println(fh, "Response: $resp")
+        println(fh, "="^60)
+        try
+            formula = @eval @formula($resp ~ 1 + group + (1 + group | tbl))
+            model   = fit(MixedModel, formula, sim_data)
+            println(model)
+            show(fh, model)
+            println(fh, "\n")
+        catch e
+            msg = "Could not fit LMM for $resp: $e"
+            println(msg)
+            println(fh, msg)
+        end
+    end
+
     open(stats_path, "w") do fh
         println(fh, "Linear Mixed-Effects Model Summary")
         println(fh, "Generated: $(now())\n")
-        println(fh, "Model formula:  param ~ 1 + group + (1 + group | tbl)")
+        println(fh, "Model:          response ~ 1 + group + (1 + group | tbl)")
         println(fh, "Fixed effect:   experimental group (WT, P, EPN)")
         println(fh, "Random effect:  optimisation table (initial-condition set)\n")
 
+        println(fh, "#"^64)
+        println(fh, "# PRIMARY — model-free AP features (identifiable observables).")
+        println(fh, "# feat_max_dvdt (max upstroke velocity) is the key g_Na proxy:")
+        println(fh, "#   C_m * dV/dt_max ≈ g_Na * m^3 h * (E_Na - V).")
+        println(fh, "#"^64)
+        for resp in feat_cols
+            fit_one_lmm(fh, resp)
+        end
+
+        println(fh, "\n" * "#"^64)
+        println(fh, "# SECONDARY — fitted HH parameters.")
+        println(fh, "# WARNING: g_Na is NON-IDENTIFIABLE from the AP waveform")
+        println(fh, "#   (flat profile likelihood; see report.jmd Critical Findings).")
+        println(fh, "#   Treat any g_Na group effect as unreliable.")
+        println(fh, "#"^64)
         for param in opt_par_group_names
-            println("\n--- $param ---")
-            println(fh, "\n" * "="^60)
-            println(fh, "Parameter: $param")
-            println(fh, "="^60)
-            try
-                formula = @eval @formula($param ~ 1 + group + (1 + group | tbl))
-                model   = fit(MixedModel, formula, sim_data)
-                println(model)
-                show(fh, model)
-                println(fh, "\n")
-            catch e
-                msg = "Could not fit LMM for $param: $e"
-                println(msg)
-                println(fh, msg)
-            end
+            fit_one_lmm(fh, param)
         end
     end
     println("Statistical summary saved to $stats_path")

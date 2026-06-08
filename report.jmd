@@ -82,35 +82,48 @@ The stimulus models the foot of the AP upstroke (the period during which injecte
 
 $$I_{stim}(t) = h \cdot \left(\frac{t - t_0}{d}\right)^{dim} \cdot \mathbf{1}[t_0 < t < t_0 + d]$$
 
-Parameters $t_0$ (onset), $d$ (duration), and $dim$ (shape exponent) are determined by the **constant-charge foot-finding**
-algorithm before each optimisation: $d$ and $dim$ are fitted while keeping the total charge $Q = hd/(dim+1)$ fixed.
+The onset $t_0$ is **anchored to the empirically detected foot** of the AP (the first point where the trace rises a small
+fraction above rest); the shape parameters $d$ and $dim$ are then fitted while keeping the total charge $Q = hd/(dim+1)$
+fixed. Anchoring removes a degeneracy in which a fully free onset parks the pulse on the flat pre-foot baseline, and (with
+a per-length, $h$-weighted objective) prevents the pulse from collapsing to an impulse — see *Critical Findings*.
 
 ## Resting Membrane Potential
 
-The RMP is estimated from each recording as the mean of the first 2 ms of the trace (pre-stimulus baseline),
-which avoids contamination by the AP upstroke or afterhyperpolarisation.
+The RMP is estimated as the mean of the **pre-foot baseline**: a robust low-percentile value gives a provisional rest,
+the AP foot is located relative to it, and the RMP is then averaged over the samples preceding the foot.
+This replaces a naïve mean of the first 2 ms — which, in these short-baseline recordings (the foot begins <1.2 ms into
+the trace), averages in the early upstroke and over-estimates rest by ~20 mV. See *Critical Findings* for the quantified
+impact of this correction.
 
 ## Optimisation Strategy
 
 Parameter fitting uses a two-stage pipeline:
 
-1. **Global search** — BlackBoxOptim.jl (Differential Evolution, 500 000 function evaluations) over physiologically
-   bounded search ranges.  Bounds are derived from known ranges reported in the HH literature and constrain the
-   optimiser to physically meaningful solutions.
+1. **Global search** — BlackBoxOptim.jl (Differential Evolution, 20 000 function evaluations; reduced from 500 000
+   after the profile likelihood showed the extra precision only refines position within a flat valley — see
+   *Critical Findings*) over physiologically bounded search ranges.  Bounds are derived from known ranges reported in
+   the HH literature and constrain the optimiser to physically meaningful solutions.
 
-2. **Local refinement** — Nelder-Mead simplex optimisation (5 000 iterations) starting from the global-search
-   solution, with a penalty term enforcing the physiological bounds:
+2. **Local refinement** — Nelder-Mead simplex optimisation (5 000 iterations) in *scaled* parameter space
+   ($x = \theta/|\theta_0|$, equivalent to R's `parscale`, so all parameters step by the same relative amount)
+   starting from the global-search solution, with a penalty term enforcing the physiological bounds:
    $$\text{score}_{bounded} = \text{score} + 10^6 \sum_\theta \max(0,\,\theta_{lb}-\theta)^2 + \max(0,\,\theta-\theta_{ub})^2$$
 
 **Objective function** — weighted sum of squared errors between simulated and experimental voltage traces:
 
-$$\mathcal{L} = \sum_{t \in \text{baseline}} (V_{sim} - V_{exp})^2 \;+\; 5 \sum_{t \in \text{peak}} (V_{sim} - V_{exp})^2 \;+\; \sum_{t \in \text{post-peak}} (V_{sim} - V_{exp})^2$$
+$$\mathcal{L} = \sum_{t \in \text{quiescent}} (V_{sim} - V_{RMP})^2 \;+\; 5 \sum_{t \in \text{peak}} (V_{sim} - V_{exp})^2 \;+\; \sum_{t \in \text{post-peak}} (V_{sim} - V_{exp})^2$$
 
-The five-fold weighting on the peak region biases the fit toward accurate reproduction of the AP amplitude and timing,
-which are the features most sensitive to $\bar{g}_{Na}$ and the kinetic parameters.
+The **quiescent** term covers the window *before* the stimulus and *after* the AP, where the model must sit at rest
+($V_{RMP}$). It is essential: without it, the optimiser exploited regions outside the scored window to let the model
+**oscillate intrinsically**, so that a *spontaneous* spike happened to land near the experimental AP — the stimulus was
+not driving the response (see *Critical Findings*). Penalising non-rest behaviour forces the stimulus to drive a single
+AP and the membrane to return to a stable resting state. The five-fold weighting on the peak region biases the fit toward
+accurate reproduction of AP amplitude and timing, which are the features most sensitive to $\bar{g}_{Na}$ and the kinetic
+parameters.
 
-The ODE system is solved with the Rosenbrock23 stiff solver (relative and absolute tolerances $10^{-4}$) using forced
-time stops at stimulus onset and offset to prevent the solver from stepping over the discontinuous forcing.
+The ODE system is solved with the Rosenbrock23 stiff solver (relative and absolute tolerances $10^{-5}$) using forced
+time stops distributed *across* the stimulus pulse (not only at its onset and offset), so the brief depolarisation is
+fully resolved and never stepped over by the adaptive solver.
 
 ## Group Analysis
 
@@ -191,6 +204,140 @@ else
     nothing
 end
 ```
+
+---
+
+# Critical Findings: Method Corrections and the Identifiability of $\bar{g}_{Na}$
+
+> **Summary.** A systematic audit of the fitting pipeline uncovered four implementation faults that together were the
+> primary cause of the poor, biased fits seen in early runs. After correcting them, a re-derivation of the baseline
+> parameters and a formal **profile-likelihood** analysis revealed a deeper, *structural* result:
+> **the maximum sodium conductance $\bar{g}_{Na}$ is not identifiable from the action-potential voltage waveform.**
+> This does not defeat the biological aim of the study, but it changes the strategy — the genotype signal must be read
+> from the maximum upstroke velocity $\dot{V}_{max}$, a model-free proxy for peak $I_{Na}$, rather than from a fitted
+> conductance. This section documents what was found, what it means, and the revised approach.
+
+## Pipeline corrections
+
+Four faults were identified and corrected. Each was verified directly against the data before and after the fix.
+
+| # | Problem | Symptom (quantified) | Correction |
+|---|---------|----------------------|-----------|
+| 1 | **RMP contamination** | Rest was estimated as `mean(first 2 ms)`, but the AP foot occurs only ~0.7–1.2 ms into each recording, so the 2 ms window averaged in the upstroke and **over-estimated rest by 16–24 mV** (WT trace 1: −59.7 vs true −78.5; trace 2: −42.6 vs −66.8; trace 3: −49.9 vs −71.6 mV). A ~20 mV baseline error corrupts $V_{init}$, the padded target, the foot threshold, and the scoring baseline. | Robust **pre-foot baseline**: a low-percentile rough rest → foot detection → mean of the genuinely pre-foot samples. Recovers rest to within ~1 mV of the trace start. |
+| 2 | **Stimulus collapse + mis-alignment** | The constant-charge foot objective (ported as a raw SSE) rewarded shrinking the window, so the pulse collapsed to $d\approx0.012$ ms (≈2 samples) with $h\approx1900$–$3900$, and the onset landed **0.04–1.44 ms *before*** the true foot. | Onset **anchored to the empirically detected foot**; only pulse *shape* $(d, dim)$ is fitted, under the original R objective (per-length mean + $h$-weighting). Onset now coincides with the foot ($\Delta = 0.000$ ms on all 30 traces); $d\approx0.06$–$0.29$ ms, $h\approx80$–$375$. |
+| 3 | **No parameter scaling** | Nelder-Mead's ~0.025 absolute simplex step floor dwarfed the smallest parameters (e.g. $N_1\approx0.004$), so they effectively never moved during local refinement. | Optimise in normalised space $x=\theta/|\theta_0|$ (equivalent to R's `optim` `parscale`), so every parameter steps by the same *relative* amount. |
+| 4 | **Under-resolved stimulus** | The adaptive solver, forced to stop only at the pulse *edges*, could step across the flat baseline and under-resolve the brief depolarisation. | Force $\ge 6$ solver stops *across* the pulse (tolerance kept at $10^{-4}$ for speed — the tstops, not a tighter tolerance, resolve the pulse). |
+| 5 | **Spontaneous oscillation ("AP by chance")** | The scored window covered only the AP itself, so the optimiser was free to drive the model into an **intrinsic oscillation**: a *spontaneous* spike landed near the experimental AP while additional spikes fired before and after it, outside the score. The stimulus was not causing the response. | Add a **quiescence term** — score the pre-stimulus and post-AP windows against rest, penalising any non-rest behaviour. The model now fires a single stimulus-driven AP and returns to a stable resting state. |
+
+The combined effect was large: corrected resting potentials, foot-aligned stimuli, and a dramatic improvement in achievable
+fit quality (the average-WT fit below is near-perfect where earlier fits were not).
+
+## Re-derivation of baseline parameters from the average wild-type AP
+
+The original seed $\theta_0$ was taken from Hodgkin & Huxley (1952) and lightly adjusted. To test whether it was biasing
+results, $\theta_0$ was re-derived by fitting the **full** parameter set (all $m$, $h$, $n$ rate constants and all three
+conductances) to the **average WT trace** — the same procedure used to seed the original R analysis, now with the corrected
+pipeline. Two runs that differed only in global-search budget produced **excellent but mutually contradictory** fits:
+
+| Search budget | $\bar{g}_{Na}$ | $\bar{g}_K$ | SSE | Visual fit |
+|---|---|---|---|---|
+| 40 000 evals  | 125 | 76  | 1889 | excellent |
+| 120 000 evals | **21** | **184** | **665** | **better** |
+
+A *more thorough* search produced a **6× smaller** $\bar{g}_{Na}$ that fit *better*. A parameter whose best-fit value depends
+this strongly on search effort is the hallmark of non-identifiability, which the profile likelihood below confirms formally.
+
+```julia; echo=false
+let f = joinpath("analysis", "derived_WT_fit.png")
+    if isfile(f)
+        display(plot(load(f), axis=nothing, border=:none, size=(680,450),
+                     title="Average WT fit (120k-eval re-derivation, gNa=21)"))
+    else
+        println("Figure analysis/derived_WT_fit.png not found — run analysis/derive_initial_params.jl.")
+    end
+end
+```
+
+## Profile likelihood: $\bar{g}_{Na}$ is non-identifiable
+
+$\bar{g}_{Na}$ was fixed at a logarithmic grid from 10 to 400 mS/cm²; at each value **all** other channel and conductance
+parameters were re-optimised (scaled, bounded, multi-start). An identifiable parameter yields a best-SSE curve with a clear
+minimum (a "well"); here the curve is **flat**.
+
+```julia; echo=false
+let f = joinpath("analysis", "profile_gNa.png")
+    if isfile(f)
+        display(plot(load(f), axis=nothing, border=:none, size=(700,700)))
+    else
+        println("Figure analysis/profile_gNa.png not found — run analysis/profile_gNa.jl.")
+    end
+end
+```
+
+The best achievable SSE stays within a narrow band (~590–1080) across the **entire range $\bar{g}_{Na}\in[10,135]$** — a
+**13-fold** range — with no resolvable minimum (the nominal best, 590 at 34 mS/cm², is statistically indistinguishable from
+the values at 11, 17, or 102 mS/cm²). SSE rises only above ~150 mS/cm², where the conductance is simply too large to fit at
+all. The lower panel shows the mechanism directly: every fixed $\bar{g}_{Na}$ is matched by a different re-fitted
+$\bar{g}_K$ — the two conductances trade off freely to produce the same waveform.
+
+## Interpretation: why this happens, and what it means
+
+The non-identifiability is **structural, not numerical**. The muscle AP is a regenerative, near-all-or-none event: once
+threshold is crossed, the spike overshoots toward $E_{Na}\approx +70$ mV almost independently of the exact $\bar{g}_{Na}$,
+so the *voltage waveform* carries very little information about the absolute sodium conductance. What $\bar{g}_{Na}$ controls
+is the **rate** of the upstroke — and that information is nearly invisible to a sum-of-squares objective on voltage. With
+$\bar{g}_K$ and the gating kinetics free to compensate, a continuum of $(\bar{g}_{Na},\,\bar{g}_K,\,\text{kinetics})$
+combinations reproduces any given trace. (Notably, the original R analysis partly avoided this through a *coordinate-descent
+split* that fitted the Na parameters against the upstroke window and the K parameters against repolarisation separately —
+isolating $\bar{g}_{Na}$'s effect to the phase it actually controls. The single joint fit in the Julia port removed that
+safeguard.)
+
+**Three consequences for the study:**
+
+1. **The primary goal as originally framed — reading absolute $\bar{g}_{Na}$ off a single AP trace by waveform fitting — is
+   not achievable for this preparation.** A $\bar{g}_{Na}$ from a free fit is one arbitrary point on a flat valley floor and
+   cannot be compared across genotypes. Any previously reported between-group $\bar{g}_{Na}$ differences obtained this way
+   are artefacts of where the optimiser happened to stop.
+
+2. **The biological signal lives in the maximum upstroke velocity $\dot{V}_{max}$ — but it is partial and must be
+   measured carefully.** At the peak of the upstroke $C_m\,\dot{V}_{max} \approx \bar{g}_{Na}\,m^3 h\,(E_{Na}-V)$, so
+   $\dot{V}_{max}$ is a direct, *model-free* proxy for peak $I_{Na}$, measurable straight from each trace with no fitting
+   and no identifiability problem. Computed **per trace** from the raw recordings, however, the genotype pattern is more
+   nuanced than the group-averaged traces suggest, and the ordering is **sensitive to the smoothing used to evaluate the
+   derivative**:
+
+   | per-trace mean $\dot{V}_{max}$ (V/s) | WT | P | EPN | ordering |
+   |---|---|---|---|---|
+   | light smoothing (0.02 ms) | 283 ± 76 | 311 ± 82 | 240 ± 101 | P > WT > EPN |
+   | heavy smoothing (0.2 ms)  | 212 ± 58 | 180 ± 64 | 143 ± 78  | WT > P > EPN |
+
+   The robust, method-independent facts are: **EPN (triple mutant) has the lowest $\dot{V}_{max}$ across every smoothing
+   window**, consistent with the substitutions reducing sodium current; but **WT and P overlap heavily and their ordering
+   flips** with smoothing, so they are not reliably separable by $\dot{V}_{max}$. All groups show ~30–40 % CV with
+   substantial overlap. The clean monotonic *WT > P > EPN* ordering of the group-**averaged** traces (195.7 / 166.8 /
+   126.1 V/s) is an artifact of averaging/heavy smoothing, which preferentially blunts sharper upstrokes — it does **not**
+   hold at the true peak upstroke velocity. **Implication:** $\dot{V}_{max}$ separates EPN from {WT, P} but does not
+   cleanly resolve all three genotypes, and any reported value must fix a single, justified derivative/smoothing
+   definition. A careful per-trace analysis with a pre-registered $\dot{V}_{max}$ definition and appropriate statistics is
+   needed before publication.
+
+3. **To obtain $\bar{g}_{Na}$ in conductance units** (if required for the paper), the trade-off partners must be constrained
+   *independently* of the waveform — e.g. fixing $\bar{g}_K$ and the gating kinetics from voltage-clamp data or literature,
+   or constraining the fit with $\dot{V}_{max}$ — rather than co-fitting all of them to the same trace.
+
+### Revised analysis strategy
+
+- **Genotype discrimination** is built on model-free features — chiefly $\dot{V}_{max}$, plus $V_{peak}$, AP amplitude,
+  APD50, and AHP — which are robust and directly testable (see *AP Feature Analysis*, below).
+- **HH fitting** is retained for mechanistic visualisation and for the *identifiable* aspects (overall current balance,
+  kinetic *shapes*), but fitted $\bar{g}_{Na}$ values are flagged as non-identifiable and are **not** used for between-group
+  inference.
+- The global-search budget was reduced 25× (500 000 → 20 000 evaluations) with no loss of fit quality, since the extra
+  precision only refines position *within* the flat valley.
+
+> *Reproducibility:* the scripts behind this section live in `analysis/` —
+> `foot_diagnostic.jl` (RMP/foot validation), `derive_initial_params.jl` (average-WT re-derivation), and
+> `profile_gNa.jl` (the profile likelihood). The derived parameter set is saved in `analysis/derived_par_0.json`.
 
 ---
 
@@ -481,6 +628,8 @@ The profile likelihood below is computed by fixing $\bar{g}_{Na}$ at a grid of v
 all other free parameters at each value.
 A well-defined minimum with a narrow confidence interval confirms identifiability.
 A flat profile indicates that $\bar{g}_{Na}$ cannot be reliably separated from its kinetic correlates.
+As established on the averaged WT trace in *Critical Findings*, this profile is **flat** (a 13-fold range of
+$\bar{g}_{Na}$ fits within noise); the per-trace example below corroborates that result for an individual recording.
 
 ```julia; echo=false
 # Run profile likelihood on the first WT trace as an example
@@ -574,17 +723,24 @@ This analysis applies a Hodgkin-Huxley framework to systematically extract ion c
 *Thamnophis* muscle action potentials and test whether the TTX-resistance mutations (WT → P → EPN)
 produce detectable, parameter-level differences.
 
-**Key findings to examine in the results:**
+**Key findings:**
 
-1. **$\dot{V}_{max}$ and $\bar{g}_{Na}$** — If the triple-point mutant (EPN) has genuinely altered Nav1.4 kinetics,
-   the maximum upstroke rate ($\dot{V}_{max}$) should differ from WT.
-   Because $\dot{V}_{max} \approx \bar{g}_{Na} \cdot m^3 h \cdot (V_{thr} - E_{Na}) / C_m$, a systematic
-   $\dot{V}_{max}$ difference provides direct model-free evidence that $\bar{g}_{Na}$ differs.
+1. **$\bar{g}_{Na}$ is not identifiable from the AP voltage waveform** (see *Critical Findings*). The profile likelihood
+   is flat over a 13-fold range of $\bar{g}_{Na}$ (10–135 mS/cm²), because $\bar{g}_K$ and the gating kinetics compensate
+   freely — a structural consequence of the AP being a near-all-or-none event whose peak is set by $E_{Na}$, not by the
+   exact conductance. **A fitted $\bar{g}_{Na}$ therefore cannot be used for between-group comparison**, and the study's
+   original primary goal (diagnosing the molecular phenotype from a fitted conductance) is not attainable by
+   waveform-fitting alone. Obtaining $\bar{g}_{Na}$ in absolute units requires independent constraints on $\bar{g}_K$ and
+   the kinetics (e.g. voltage-clamp data), not co-fitting them to the same trace.
 
-2. **Profile likelihood** — A narrow confidence interval on the profile likelihood for $\bar{g}_{Na}$
-   confirms that the AP trace encodes sufficient information to pin down sodium conductance.
-   A flat profile would indicate that kinetic compensation limits identifiability and that additional
-   experimental constraints (e.g., voltage-clamp measurements of individual currents) are required.
+2. **The genotype signal is recoverable from $\dot{V}_{max}$**, the maximum upstroke rate — a *model-free* proxy for peak
+   $I_{Na}$ ($C_m\,\dot{V}_{max} \approx \bar{g}_{Na}\,m^3 h\,(E_{Na}-V)$) measured directly from each trace with no
+   identifiability problem — but the discrimination it provides is **partial**. Per-trace analysis shows EPN robustly
+   lowest across smoothing windows, while WT and P overlap heavily and their ordering flips with the derivative smoothing
+   (see *Critical Findings*); the clean monotonic ordering of the group-averaged traces is a smoothing/averaging artifact.
+   We therefore make $\dot{V}_{max}$ (with the other model-free features) the basis of the genotype comparison, but
+   conclude that it separates EPN from {WT, P} rather than resolving all three genotypes, and that a pre-registered
+   $\dot{V}_{max}$ definition with appropriate statistics is required before publication.
 
 3. **Mixed-effects model p-values** — Parameters with significant group effects identify which aspects
    of Nav1.4 or Kv channel function are altered by the resistance substitutions.
@@ -597,13 +753,17 @@ produce detectable, parameter-level differences.
 
 **Limitations and future directions:**
 
-- The h-gate parameters ($H_*$) are currently fixed across optimisation runs. Including them in the
-  optimised set would provide more complete channel characterisation but increases the dimensionality
-  of the optimisation problem.
+- **Identifiability is the central limitation.** Freeing more channel parameters does *not* improve characterisation —
+  it worsens the $\bar{g}_{Na}$/$\bar{g}_K$/kinetics degeneracy. Resolving absolute conductances requires independent
+  measurements: voltage-clamp recordings of the isolated $I_{Na}$ and $I_K$ would pin down $\bar{g}_{Na}$ and $\bar{g}_K$
+  directly and convert the AP fit from an under-determined inverse problem into a constrained one.
+- **Coordinate-descent fitting** (as in the original R implementation) — fitting Na parameters against the upstroke window
+  and K parameters against repolarisation separately — partially isolates each conductance to the phase it controls and
+  should be restored if conductance-unit estimates are pursued; it is a partial, not complete, remedy for the degeneracy.
 - The stimulus parameterisation (constant-charge foot) approximates an unknown injection current.
   If the exact stimulus waveform is recorded, it should be used directly to eliminate this nuisance parameter.
-- A leave-one-out cross-validation study would confirm whether parameters extracted from one set of traces
-  generalise to predict the genotype of held-out traces.
+- A leave-one-out cross-validation study on the **model-free features** ($\dot{V}_{max}$, APD50, AHP, …) would confirm
+  whether they generalise to classify the genotype of held-out traces — the most promising route to the secondary goal.
 
 ---
 

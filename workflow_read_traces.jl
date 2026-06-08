@@ -15,6 +15,7 @@
 
 using .ActionPotentialModel
 using CSV, DataFrames, Printf, Dates, Plots
+import ProgressMeter   # qualified use only — avoids next!/update! clashes with Sobol etc.
 
 # ---------------------------------------------------------------------------
 # Per-file processing
@@ -41,7 +42,13 @@ function process_trace_file(file::String, output_dir::String;
     # GPU: run on main process (closures inside gpu_grid_search! must not cross
     #      into distributed workers — Julia 1.12 world-age restriction).
     # CPU: distribute one trace per worker via pmap.
-    results = use_gpu ? map(fit_trace, tasks) : pmap(fit_trace, tasks)
+    # progress_(p)map shows a live bar + ETA; one tick per finished trace,
+    # negligible overhead (one update per multi-second fit). GPU mode runs on the
+    # main process (map); CPU mode distributes via pmap.
+    prog = ProgressMeter.Progress(length(tasks); desc="  $file ", showspeed=true)
+    ProgressMeter.update!(prog, 0)   # render the bar immediately at 0%
+    results = use_gpu ? ProgressMeter.progress_map(fit_trace, tasks; progress=prog) :
+                        ProgressMeter.progress_pmap(fit_trace, tasks; progress=prog)
 
     output_basename = replace(file, ".csv" => "")
     results_df      = DataFrame()

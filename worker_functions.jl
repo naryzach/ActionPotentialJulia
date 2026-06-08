@@ -4,13 +4,22 @@
 # Included @everywhere in main.jl AFTER workers are added, so each worker
 # has these definitions in its own top-level world (Julia 1.12 requirement).
 
+# Loaded here (a top-level include, so `import` is legal) rather than in main.jl's
+# @everywhere block (inside a function, where `import` is a syntax error). Workers
+# need ProgressMeter present so they can deserialise progress_pmap's wrapper
+# closure, whose type lives in the ProgressMeter module.
+import ProgressMeter
+
 function fit_trace(task)
     p0, bounds, trace, time, name, opn, use_gpu, num_traj = task
     redirect_stdout(devnull) do
         ap     = ActionPotentialModel.ActionPotential(p0, trace, time, name=name)
         result = ActionPotentialModel.optimize!(ap, opn; bounds=bounds,
                                                 use_gpu=use_gpu, num_trajectories=num_traj)
-        feats  = ActionPotentialModel.extract_ap_features(ap)
+        # Model-free features (dV/dt_max etc.) from the EXPERIMENTAL trace — these
+        # are the robust, identifiable observables for the genotype comparison
+        # (fitted g_Na is non-identifiable; see report.jmd Critical Findings).
+        feats  = ActionPotentialModel.extract_ap_features(ap; use_experimental=true)
         return (
             name           = name,
             params         = result["par"],

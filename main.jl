@@ -107,6 +107,8 @@ function main()
             @everywhere begin
                 # Guards prevent double-loading on the main process; workers
                 # always hit all three includes since they start with a clean slate.
+                # (worker_functions.jl also `import`s ProgressMeter, so workers can
+                #  deserialise progress_pmap's wrapper closure.)
                 isdefined(Main, :par_0)              || include("config.jl")
                 isdefined(Main, :ActionPotentialModel) || include("ActionPotential.jl")
                 isdefined(Main, :fit_trace)            || include("worker_functions.jl")

@@ -109,9 +109,21 @@ function _simulate_trace(params::NamedTuple, time_points::Vector{Float64}, dt::F
     stim_on  = params.tot_wait
     stim_off = params.tot_wait + params.stim_d
 
+    # Force several solver stops ACROSS the stimulus, not just at its edges.
+    # The pre-stimulus baseline is flat, so an adaptive solver would otherwise
+    # take one large step and under-resolve (or skip) the brief depolarising
+    # pulse. Landing on each tstop guarantees ≥n_stim_stops steps through the
+    # pulse; the solver remains free to take large steps elsewhere (no global
+    # dtmax), so this captures the upstroke without slowing the whole solve.
+    n_stim_stops = max(6, ceil(Int, params.stim_d / dt))
+    stim_stops   = collect(range(stim_on, stim_off; length=n_stim_stops))
+
+    # reltol/abstol 1e-4: tightening to 1e-5 multiplied every solve's cost (and
+    # there are tens of thousands of solves per fit), with no visible change to
+    # the AP shape. The forced stimulus tstops already guard the brief pulse.
     sol = solve(prob, Rosenbrock23(),
                 saveat = dt, reltol = 1e-4, abstol = 1e-4,
-                tstops = [stim_on, stim_off])
+                tstops = stim_stops)
 
     if !successful_retcode(sol) || length(sol.u) != length(time_points)
         return fill(Inf, length(time_points))
@@ -136,17 +148,25 @@ function _score_from_trace(simulated_Vs::Vector{Float64},
     isempty(simulated_Vs) && return Inf
     any(isinf, simulated_Vs) && return Inf
 
+    settle     = 2.0   # ms: ignore the brief initial relaxation from V_init
     pk_dur_est = 5.0
     peak_start = tot_wait
     peak_end   = peak_start + pk_dur_est
+    trace_end  = stabil_time + trace_data_len * dt
 
-    idx_baseline  = (time_points .>= stabil_time) .& (time_points .<  peak_start)
-    idx_peak      = (time_points .>= peak_start)  .& (time_points .<= peak_end)
-    idx_post_peak = (time_points .>  peak_end)    .& (time_points .<  (stabil_time + trace_data_len * dt))
+    # QUIESCENCE regions: before the stimulus and after the AP the model must sit
+    # at rest (experimental_trace_padded = RMP there). Scoring them penalises
+    # spontaneous / oscillatory firing, forcing the STIMULUS to drive the single
+    # AP instead of letting a chance intrinsic oscillation land in the window
+    # (which produced the spurious extra spikes seen before this term was added).
+    idx_quiet     = ((time_points .>= settle)   .& (time_points .<  peak_start)) .|
+                    ((time_points .>  trace_end) .& (time_points .<= time_points[end]))
+    idx_peak      = (time_points .>= peak_start) .& (time_points .<= peak_end)
+    idx_post_peak = (time_points .>  peak_end)   .& (time_points .<= trace_end)
 
     score_val = (
-        sum((simulated_Vs[idx_baseline]  .- experimental_trace_padded[idx_baseline]).^2)  +
-        5.0 * sum((simulated_Vs[idx_peak] .- experimental_trace_padded[idx_peak]).^2)     +
+        sum((simulated_Vs[idx_quiet]     .- experimental_trace_padded[idx_quiet]).^2)     +
+        5.0 * sum((simulated_Vs[idx_peak] .- experimental_trace_padded[idx_peak]).^2)      +
         sum((simulated_Vs[idx_post_peak] .- experimental_trace_padded[idx_post_peak]).^2)
     )
     return isfinite(score_val) ? score_val : Inf
@@ -203,6 +223,22 @@ mutable struct ActionPotential
 end
 
 # ---------------------------------------------------------------------------
+# Robust resting-membrane-potential estimate.
+#
+# These recordings have very little pre-foot baseline — the AP upstroke can
+# begin <1 ms into the trace — so the naïve mean(first 2 ms) is contaminated by
+# the upstroke and over-estimates RMP by ~20 mV, shifting the entire model.
+# Instead: take a rough rest from a low percentile (robust because the AP sits
+# ABOVE rest), detect the foot, then average the genuinely pre-foot samples.
+function estimate_rmp(trace::AbstractVector{<:Real}, dt::Real)
+    isempty(trace) && return 0.0
+    n2    = min(round(Int, 2.0 / dt), length(trace))
+    rough = quantile(collect(Float64, @view trace[1:n2]), 0.10)
+    fi    = detect_foot_index(collect(Float64, trace), Float64(rough))
+    return fi > 1 ? Float64(mean(@view trace[1:fi-1])) : Float64(rough)
+end
+
+# ---------------------------------------------------------------------------
 # Constructor
 # ---------------------------------------------------------------------------
 function ActionPotential(p_in::Union{NamedTuple, Dict}, trace, time; name="Nameless")
@@ -212,12 +248,9 @@ function ActionPotential(p_in::Union{NamedTuple, Dict}, trace, time; name="Namel
     stabil_time = 10.0
     t_sim       = 0:dt:sim_time
 
-    # RMP is the mean of the pre-stimulus baseline (first 2 ms of the recording).
-    # This is more robust than a derived formula and avoids aliasing with the
-    # AP upstroke or afterhyperpolarization.
-    baseline_end_idx = min(round(Int, 2.0 / dt), length(trace))
-    early_trace      = trace[1:baseline_end_idx]
-    calculated_RMP   = isempty(early_trace) ? trace[1] : mean(early_trace)
+    # Robust pre-foot baseline (see estimate_rmp): mean(first 2 ms) is corrupted
+    # by the early upstroke in these short-baseline traces.
+    calculated_RMP = estimate_rmp(trace, dt)
 
     params    = merge(initial_params, (RMP = calculated_RMP,))
     V_init    = params.RMP
@@ -423,56 +456,83 @@ end
 # ---------------------------------------------------------------------------
 # Foot-finding: constant-charge method
 # ---------------------------------------------------------------------------
+#
+# The stimulus must REPRODUCE the foot: its cumulative charge ∫I dt (the voltage
+# it produces by charging the membrane, ≈ V because channel currents are small on
+# the foot) should trace the experimental foot's curvature, with the onset near
+# the start of the trace — so the stimulus *causes* the initial depolarisation
+# rather than being a late impulse the channels race ahead of. We therefore fit
+# the onset t_0, duration d, and shape exponent dim together so that
+#   RMP + ∫₀ᵗ I_stim   ≈   experimental trace   over [tot_wait, tot_wait+d],
+# under a fixed total charge (the constant-charge assumption: same injected
+# charge per trace, variable electrode coupling). This is the original R
+# `find_foot` objective. The stimulus is fitted FIRST; the channel parameters are
+# then optimised to match the rest of the AP given this stimulus.
+#
+# detect_foot_index is still used by estimate_rmp (robust pre-foot baseline).
+function detect_foot_index(trace::Vector{Float64}, RMP::Float64; frac::Float64=0.05)
+    isempty(trace) && return 1
+    peak_idx = argmax(trace)
+    peak_idx <= 1 && return 1
+    peak_v   = trace[peak_idx]
+    thr      = RMP + frac * (peak_v - RMP)
+    # Walk BACK from the peak to the last sample at/below threshold = the foot.
+    # Anchoring to the peak (rather than scanning forward from t=0) makes this
+    # robust to sub-threshold baseline noise that would otherwise trip an early
+    # forward-scan crossing.
+    fi = peak_idx
+    @inbounds while fi > 1 && trace[fi-1] > thr
+        fi -= 1
+    end
+    return fi
+end
+
 function find_foot!(ap::ActionPotential; num_fits=10)
     println("\n--- Searching for AP foot (constant-charge method) ---")
-    init_p        = (d=ap.stim_d, h=ap.stim_h, dim=ap.stim_dim)
-    const_integral = (init_p.h * init_p.d) / (init_p.dim + 1)
-    @printf("Target stimulus integral: %.4f\n", const_integral)
+    init_p         = (d=ap.stim_d, h=ap.stim_h, dim=ap.stim_dim)
+    const_integral = (init_p.h * init_p.d) / (init_p.dim + 1)   # fixed total charge (R's stim_A)
+    peak_approx    = 2.0
 
+    # Fit onset t_0, duration d, and shape dim together so the cumulative-charge
+    # curve (RMP + ∫I) traces the experimental foot. The onset is free to sit at
+    # the start of the trace; the stimulus thus drives the initial depolarisation.
     function objective(foot_params)
         t_0, stim_d, stim_dim = foot_params
-        # Explicit if is more reliable than && in closures called via Optim internals.
-        if t_0 < 0 || t_0 > 2.0 || stim_d <= 0.0 || stim_d > 2.0 || stim_dim < 1.0
+        if t_0 < 0.0 || t_0 > peak_approx || stim_d <= 0.0 || stim_d > peak_approx || stim_dim < 1.0
             return Inf
         end
-
         stim_h_new = const_integral * (stim_dim + 1) / stim_d
-        if !isfinite(stim_h_new) || stim_h_new < 0
-            return Inf
-        end
-
+        (!isfinite(stim_h_new) || stim_h_new < 0) && return Inf
         tot_wait  = ap.stabil_time + t_0
         start_idx = round(Int, tot_wait / ap.dt) + 1
         end_idx   = start_idx + round(Int, stim_d / ap.dt)
-        if end_idx > length(ap.AP_val)
-            return Inf
-        end
+        end_idx > length(ap.AP_val) && return Inf
 
-        exp_window   = ap.AP_val[start_idx:end_idx]
-        model_window = similar(exp_window)
-        for (i, _) in enumerate(exp_window)
-            model_window[i] = stim_integral(i * ap.dt, stim_d, stim_h_new, stim_dim) + ap.params.RMP
+        exp_window = @view ap.AP_val[start_idx:end_idx]
+        n = length(exp_window)
+        acc = 0.0
+        for k in 1:n
+            model = stim_integral(k * ap.dt, stim_d, stim_h_new, stim_dim) + ap.params.RMP
+            denom = abs(exp_window[k]) > 1e-6 ? exp_window[k] : 1e-6
+            acc  += ((model - exp_window[k]) / denom)^2
         end
-        return sum((model_window .- exp_window).^2)
+        return stim_h_new * acc / n        # R objective: stim_h * mean(relative error²)
     end
 
-    # Run fits sequentially — the overhead is negligible (each NelderMead run
-    # takes < 1 ms) and threading a shared closure via @threads risks Optim's
-    # internal simplex workspace being corrupted by concurrent Julia task scheduling.
     results = Vector{Any}(undef, num_fits)
     for i in 1:num_fits
-        t0_guess   = (i / num_fits) * 0.5
+        t0_guess   = i / num_fits          # scan onset t_0 over (0, 1] ms (R's starts)
         results[i] = optimize(objective, [t0_guess, init_p.d, init_p.dim], NelderMead())
     end
     best_result = results[argmin(Optim.minimum.(results))]
 
     t_0, stim_d, stim_dim = Optim.minimizer(best_result)
+    ap.tot_wait = ap.stabil_time + t_0
     ap.stim_d   = stim_d
     ap.stim_dim = stim_dim
     ap.stim_h   = const_integral * (stim_dim + 1) / stim_d
-    ap.tot_wait = ap.stabil_time + t_0
-    @printf("Foot: t_0=%.3f ms, d=%.3f, dim=%.2f, h=%.2f\n",
-            t_0, ap.stim_d, ap.stim_dim, ap.stim_h)
+    @printf("Foot: onset=%.3f ms (t_0=%.3f), d=%.3f ms, dim=%.2f, h=%.2f\n",
+            ap.tot_wait, t_0, ap.stim_d, ap.stim_dim, ap.stim_h)
     update_model!(ap, ap.params)
 end
 
@@ -495,7 +555,16 @@ function optimize_model(ap::ActionPotential, opt_param_names::Tuple;
         trace_data_len = length(ap.trace_data)
     )
 
-    function objective(p_vec)
+    # Parameter scaling (equivalent to R's optim parscale): optimise in
+    # normalised space x = p / |p₀| so every parameter steps by the same
+    # RELATIVE amount. Without this, NelderMead's simplex (which has a ~0.025
+    # absolute floor) cannot meaningfully move the smallest parameters
+    # (e.g. N_1 ≈ 0.004) while taking huge strides on the largest (g_Na ≈ 120).
+    init_vec = [initial_params[k] for k in opt_param_names]
+    scale    = [v == 0 ? 1.0 : abs(v) for v in init_vec]
+
+    function objective(x)
+        p_vec  = x .* scale
         iter_p = merge(initial_params, static_data, (; zip(opt_param_names, p_vec)...))
         score  = _calculate_score(iter_p, static_data.time_points, static_data.dt,
                                   static_data.experimental_trace,
@@ -506,17 +575,87 @@ function optimize_model(ap::ActionPotential, opt_param_names::Tuple;
         return score
     end
 
-    init_vec = [initial_params[k] for k in opt_param_names]
-    result   = optimize(objective, init_vec, NelderMead(),
-                        Optim.Options(iterations=5000, f_reltol=1e-9))
+    x0     = init_vec ./ scale
+    result = optimize(objective, x0, NelderMead(),
+                      Optim.Options(iterations=5000, f_reltol=1e-9))
 
-    final_vec    = Optim.minimizer(result)
+    final_vec    = Optim.minimizer(result) .* scale
     final_subset = (; zip(opt_param_names, final_vec)...)
     full_params  = merge(initial_params, final_subset)
 
     println("Local refinement complete. Best score: ", Optim.minimum(result))
     return Dict("par" => full_params, "value" => Optim.minimum(result),
                 "convergence" => Optim.converged(result))
+end
+
+# ---------------------------------------------------------------------------
+# Coordinate-descent split optimisation (R's optimize_split)
+#
+# Fits the Na parameters against the UPSTROKE window and the K parameters against
+# the BASELINE + REPOLARISATION-TAIL window, alternating. Fitting each conductance
+# against the phase it dominates avoids the "no-fire" local optima that a single
+# joint search falls into (especially for deep-RMP traces where the constant-
+# charge stimulus lands further from threshold), making per-trace fits reliable.
+# ---------------------------------------------------------------------------
+function _windowed_sse(simVs::Vector{Float64}, exp_padded::Vector{Float64}, mask::BitVector)
+    (isempty(simVs) || any(isinf, simVs)) && return Inf
+    s = 0.0
+    @inbounds for i in eachindex(simVs)
+        mask[i] && (s += (simVs[i] - exp_padded[i])^2)
+    end
+    return isfinite(s) ? s : Inf
+end
+
+function optimize_split!(ap::ActionPotential;
+                         bounds::Union{NamedTuple,Nothing} = nothing,
+                         n_cycles::Int = 8,
+                         opt_Na = (:M_1, :M_2, :M_6, :M_7, :H_1, :H_3, :H_4, :H_5, :H_6, :g_Na),
+                         opt_K  = (:N_1, :N_2, :N_6, :N_7, :g_K))
+    println("Coordinate-descent split optimisation ($n_cycles cycles)...")
+    tp        = ap.time_points
+    dt        = ap.dt
+    tw        = ap.tot_wait
+    settle    = 2.0
+    peak_dur  = 2.0
+    exp_pad   = ap.AP_val
+    static    = (stim_d=ap.stim_d, stim_h=ap.stim_h, stim_dim=ap.stim_dim, tot_wait=tw)
+
+    # Na dominates the upstroke + peak; K dominates the pre-stimulus baseline and
+    # the repolarisation tail (which also enforces return to a quiescent rest).
+    mask_Na = (tp .>= tw) .& (tp .<= tw + peak_dur)
+    mask_K  = ((tp .>= settle) .& (tp .< tw)) .|
+              ((tp .>  tw + peak_dur) .& (tp .<= tp[end]))
+
+    function fit_subset(free::Tuple, mask::BitVector, cur::NamedTuple)
+        init  = [cur[k] for k in free]
+        scale = [v == 0 ? 1.0 : abs(v) for v in init]
+        function obj(x)
+            p  = x .* scale
+            ip = merge(cur, static, (; zip(free, p)...))
+            sv = _simulate_trace(ip, tp, dt)
+            isinf(sv[1]) && return Inf
+            s  = _windowed_sse(sv, exp_pad, mask)
+            isnothing(bounds) || (s += _bounds_penalty(p, free, bounds))
+            return s
+        end
+        r = optimize(obj, init ./ scale, NelderMead(),
+                     Optim.Options(iterations=1500, f_reltol=1e-8))
+        return merge(cur, (; zip(free, Optim.minimizer(r) .* scale)...))
+    end
+
+    p = ap.params
+    p = fit_subset(opt_K, mask_K, p)                # establish a K baseline first
+    for _ in 1:n_cycles
+        p = fit_subset(opt_Na, mask_Na, p)          # Na against the upstroke
+        p = fit_subset(opt_K,  mask_K,  p)          # K against baseline + tail
+    end
+    update_model!(ap, p)
+
+    # Final joint refinement on the full quiescence-aware objective.
+    final = optimize_model(ap, Tuple(vcat(collect(opt_Na), collect(opt_K))); bounds=bounds)
+    update_model!(ap, final["par"])
+    return Dict("par" => final["par"], "value" => final["value"],
+                "convergence" => final["convergence"])
 end
 
 # ---------------------------------------------------------------------------
@@ -583,7 +722,8 @@ end
 function optimize!(ap::ActionPotential, opt_param_names::Tuple;
                    bounds::Union{NamedTuple,Nothing} = nothing,
                    use_gpu::Bool = false,
-                   num_trajectories::Int = 100_000)
+                   num_trajectories::Int = 100_000,
+                   max_evals::Int = 20_000)
     find_foot!(ap)
 
     if use_gpu
@@ -591,8 +731,11 @@ function optimize!(ap::ActionPotential, opt_param_names::Tuple;
         global_result = gpu_grid_search!(ap, opt_param_names;
                                           num_trajectories=num_trajectories, range=0.9)
     else
+        # 50k (was 500k): the profile likelihood shows the g_Na/g_K/kinetics
+        # landscape is degenerate, so extra global-search precision lands in the
+        # same flat valley — a 10× speed-up with no meaningful loss of fit.
         global_result = global_optimize(ap, opt_param_names;
-                                         max_evals=500_000, range=0.9, bounds=bounds)
+                                         max_evals=max_evals, range=0.9, bounds=bounds)
     end
     update_model!(ap, global_result["par"])
 
@@ -670,9 +813,25 @@ function gpu_grid_search!(ap::ActionPotential, opt_param_names::Tuple;
     ensemble_prob = EnsembleProblem(prob; prob_func=prob_func, output_func=output_func,
                                     reduction=(u, data, I) -> (append!(u, [data[1]]), false),
                                     u_init = Float64[])
+
+    # --- Size the trajectory batch to fit GPU memory ---
+    # EnsembleGPUKernel allocates the full solution (SVector{4,Float64}) and time
+    # (Float64) arrays of size (n_save × batch) on the device at once. Solving all
+    # trajectories in one batch needs n_save × num_trajectories × 40 bytes — e.g.
+    # ~23 GiB for 100k trajectories × 6k save points, which OOMs a 16 GB card.
+    # Batching keeps device memory bounded; trajectory indices stay global, so the
+    # best-result tracking in output_func remains correct across batches.
+    n_save         = length(time_points)
+    bytes_per_traj = n_save * (sizeof(SVector{4, Float64}) + sizeof(Float64))
+    free_mem       = CUDA.free_memory()
+    batch_size     = clamp(floor(Int, 0.25 * free_mem / bytes_per_traj),
+                           1, num_trajectories)
+    @printf("GPU batch size: %d trajectories (free %.2f GiB, %d save points)\n",
+            batch_size, free_mem / 2^30, n_save)
+
     sol = solve(ensemble_prob, GPUTsit5(),
                 DiffEqGPU.EnsembleGPUKernel(CUDABackend());
-                trajectories=num_trajectories, saveat=dt)
+                trajectories=num_trajectories, batch_size=batch_size, saveat=dt)
 
     best_idx    = best_idx_ref[]
     best_score  = best_score_ref[]

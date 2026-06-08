@@ -1,5 +1,13 @@
 # config.jl
 
+# Render plots off-screen. On headless machines (WSL, servers) the GR backend
+# otherwise tries to open a Qt display window and crashes with
+# "Could not load the Qt platform plugin" / "Aborted (core dumped)".
+# GKSwstype=100 makes GR write image files directly without a display.
+# Must be set before Plots/GR initialises its workstation (i.e. before the first
+# plot call), so we do it here in the first-loaded config file.
+ENV["GKSwstype"] = "100"
+
 using Printf
 using CSV, DataFrames
 
