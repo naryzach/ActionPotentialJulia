@@ -22,11 +22,13 @@ using CSV, DataFrames
 #   alpha_n(V) = N_1 * smooth_max_zero(V - N_2)
 #   beta_n(V)  = exp((V + N_7) / N_6)
 #
-# H parameters are calibrated so that at rest (≈ −70 mV):
-#   infty_h ≈ 0.75  (Na channels ≈ 75% de-inactivated at rest)
-#   tau_h   ≈ 9 ms  (physiological inactivation time constant)
-# This matches the standard Hodgkin-Huxley formulation converted to absolute
-# voltage with V_rest = −65 mV.
+# H parameters use the snake-muscle values from the original R analysis, giving
+# at rest (≈ −70 mV) infty_h ≈ 0.03 — Na channels almost fully INACTIVATED at rest.
+# This (NOT the textbook squid-axon value infty_h ≈ 0.75) is essential: the
+# textbook h-gate leaves the membrane a hair-trigger that re-fires/oscillates,
+# producing spurious extra spikes and unfittable traces (million-point quiescence
+# violations). With Na inactivated at rest, the model fires a single stimulus-
+# driven AP and returns to a stable rest — see report.jmd, Critical Findings.
 # ---------------------------------------------------------------------------
 const par_0 = (
     # Membrane properties
@@ -35,11 +37,10 @@ const par_0 = (
     # Sodium channel — m gate (activation)
     M_1 = 0.523,  M_2 = -69.7,  M_6 = -17.6,  M_7 = 30.8,
 
-    # Sodium channel — h gate (inactivation)
-    # Standard HH values converted to absolute voltage (V_rest = −65 mV):
-    #   alpha_h(V) = 0.07 * exp((V + 65) / (−20))
-    #   beta_h(V)  = 1 / (1 + exp((V + 35) / (−10)))
-    H_1 = 0.07,  H_3 = -20.0,  H_4 = 35.0,  H_5 = -10.0,  H_6 = 65.0,
+    # Sodium channel — h gate (inactivation) — snake-muscle values (R analysis).
+    #   alpha_h(V) = H_1·exp((V + H_6)/H_3),   beta_h(V) = 1/(1 + exp((V + H_4)/H_5))
+    # Gives infty_h(−70) ≈ 0.03 (Na inactivated at rest); see header note.
+    H_1 = 1.0,  H_3 = -21.1,  H_4 = 68.3,  H_5 = -3.67,  H_6 = 161.5,
 
     # Potassium channel — n gate (activation)
     N_1 = 0.004,  N_2 = -119.0,  N_6 = -23.0,  N_7 = 64.5,
@@ -58,11 +59,11 @@ const par_bounds = (
     M_2    = (-120.0, -30.0),
     M_6    = ( -40.0,  -3.0),
     M_7    = (   5.0,  80.0),
-    H_1    = ( 0.001,   1.0),
+    H_1    = ( 0.001,   5.0),
     H_3    = ( -40.0,  -3.0),
     H_4    = (  10.0,  80.0),
     H_5    = ( -25.0,  -2.0),
-    H_6    = (  20.0, 130.0),
+    H_6    = (  20.0, 220.0),
     N_1    = ( 1e-4,   0.1),
     N_2    = (-160.0, -60.0),
     N_6    = ( -45.0,  -5.0),

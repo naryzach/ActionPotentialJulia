@@ -15,7 +15,7 @@ function main_report(; format::Symbol = :auto)
     println("\n--- Starting: Report Generation ---")
 
     input_jmd  = joinpath(pwd(), "report.jmd")
-    date_str   = Dates.format(now(), "yyyy-mm-dd")
+    date_str   = Dates.format(now(), "yyyy-mm-dd_HHMMSS")
 
     if !isfile(input_jmd)
         error("report.jmd not found in $(pwd()). Run from the project root.")
@@ -34,40 +34,25 @@ function main_report(; format::Symbol = :auto)
               "Run `julia main.jl --workflow traces` first."
     end
 
-    # Determine format
-    chosen_format = if format == :pdf
-        :pdf
-    elseif format == :html
-        :html
-    else
-        # Auto-detect: try PDF, fall back to HTML
-        latex_ok = !isnothing(Sys.which("pdflatex")) || !isnothing(Sys.which("lualatex"))
-        latex_ok ? :pdf : :html
+    # Always compile PDF first, then HTML
+    out_path_pdf = joinpath(pwd(), "Notebook", "AP_Model_Report_$(date_str).pdf")
+    println("Compiling to PDF: $out_path_pdf")
+    try
+        weave(input_jmd, doctype="md2pdf", out_path=out_path_pdf)
+        println("\nPDF report saved to: $out_path_pdf")
+    catch e
+        @warn "PDF compilation failed (LaTeX error?).\n$e"
     end
 
-    if chosen_format == :pdf
-        out_path = joinpath(pwd(), "Notebook", "AP_Model_Report_$(date_str).pdf")
-        println("Compiling to PDF: $out_path")
-        try
-            weave(input_jmd, doctype="md2pdf", out_path=out_path)
-            println("\nPDF report saved to: $out_path")
-        catch e
-            @warn "PDF compilation failed (LaTeX error?). Falling back to HTML.\n$e"
-            chosen_format = :html
-        end
-    end
-
-    if chosen_format == :html
-        out_path = joinpath(pwd(), "Notebook", "AP_Model_Report_$(date_str).html")
-        println("Compiling to HTML: $out_path")
-        try
-            weave(input_jmd, doctype="md2html", out_path=out_path)
-            println("\nHTML report saved to: $out_path")
-            println("Open in a browser or convert to PDF with:")
-            println("  chromium --headless --print-to-pdf=$out_path $out_path")
-        catch e
-            println("\nReport compilation failed:")
-            showerror(stdout, e, catch_backtrace())
-        end
+    out_path_html = joinpath(pwd(), "Notebook", "AP_Model_Report_$(date_str).html")
+    println("\nCompiling to HTML: $out_path_html")
+    try
+        weave(input_jmd, doctype="md2html", out_path=out_path_html)
+        println("\nHTML report saved to: $out_path_html")
+        println("Open in a browser or convert to PDF with:")
+        println("  chromium --headless --print-to-pdf=$out_path_html $out_path_html")
+    catch e
+        println("\nHTML Report compilation failed:")
+        showerror(stdout, e, catch_backtrace())
     end
 end

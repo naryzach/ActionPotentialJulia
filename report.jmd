@@ -85,14 +85,14 @@ $$I_{stim}(t) = h \cdot \left(\frac{t - t_0}{d}\right)^{dim} \cdot \mathbf{1}[t_
 The onset $t_0$ is **anchored to the empirically detected foot** of the AP (the first point where the trace rises a small
 fraction above rest); the shape parameters $d$ and $dim$ are then fitted while keeping the total charge $Q = hd/(dim+1)$
 fixed. Anchoring removes a degeneracy in which a fully free onset parks the pulse on the flat pre-foot baseline, and (with
-a per-length, $h$-weighted objective) prevents the pulse from collapsing to an impulse — see *Critical Findings*.
+a per-length, $h$-weighted objective) prevents the pulse from collapsing to an impulse — see **Critical Findings**.
 
 ## Resting Membrane Potential
 
 The RMP is estimated as the mean of the **pre-foot baseline**: a robust low-percentile value gives a provisional rest,
 the AP foot is located relative to it, and the RMP is then averaged over the samples preceding the foot.
 This replaces a naïve mean of the first 2 ms — which, in these short-baseline recordings (the foot begins <1.2 ms into
-the trace), averages in the early upstroke and over-estimates rest by ~20 mV. See *Critical Findings* for the quantified
+the trace), averages in the early upstroke and over-estimates rest by ~20 mV. See **Critical Findings** for the quantified
 impact of this correction.
 
 ## Optimisation Strategy
@@ -101,7 +101,7 @@ Parameter fitting uses a two-stage pipeline:
 
 1. **Global search** — BlackBoxOptim.jl (Differential Evolution, 20 000 function evaluations; reduced from 500 000
    after the profile likelihood showed the extra precision only refines position within a flat valley — see
-   *Critical Findings*) over physiologically bounded search ranges.  Bounds are derived from known ranges reported in
+   **Critical Findings**) over physiologically bounded search ranges.  Bounds are derived from known ranges reported in
    the HH literature and constrain the optimiser to physically meaningful solutions.
 
 2. **Local refinement** — Nelder-Mead simplex optimisation (5 000 iterations) in *scaled* parameter space
@@ -115,8 +115,8 @@ $$\mathcal{L} = \sum_{t \in \text{quiescent}} (V_{sim} - V_{RMP})^2 \;+\; 5 \sum
 
 The **quiescent** term covers the window *before* the stimulus and *after* the AP, where the model must sit at rest
 ($V_{RMP}$). It is essential: without it, the optimiser exploited regions outside the scored window to let the model
-**oscillate intrinsically**, so that a *spontaneous* spike happened to land near the experimental AP — the stimulus was
-not driving the response (see *Critical Findings*). Penalising non-rest behaviour forces the stimulus to drive a single
+**oscillate intrinsically**, so that a **spontaneous** spike happened to land near the experimental AP — the stimulus was
+not driving the response (see **Critical Findings**). Penalising non-rest behaviour forces the stimulus to drive a single
 AP and the membrane to return to a stable resting state. The five-fold weighting on the peak region biases the fit toward
 accurate reproduction of AP amplitude and timing, which are the features most sensitive to $\bar{g}_{Na}$ and the kinetic
 parameters.
@@ -128,8 +128,8 @@ fully resolved and never stepped over by the adaptive solver.
 ## Group Analysis
 
 The **group-level workflow** fits every individual trace from $N_{tbl} = 25$ different initial-condition tables generated
-by a Sobol low-discrepancy sequence.  Each table randomly varies the *fixed* parameters ($H_*$, $N_1$, $N_2$, $g_{Leak}$)
-by $\pm 25\%$ while the *optimised* parameters ($N_6, N_7, M_6, M_7, M_1, M_2, \bar{g}_{Na}, \bar{g}_K, V_{RMP}$) are
+by a Sobol low-discrepancy sequence.  Each table randomly varies the **fixed** parameters ($H_*$, $N_1$, $N_2$, $g_{Leak}$)
+by $\pm 25\%$ while the **optimised** parameters ($N_6, N_7, M_6, M_7, M_1, M_2, \bar{g}_{Na}, \bar{g}_K, V_{RMP}$) are
 determined by the two-stage optimiser.  This multi-start approach robustly explores the parameter space and provides the
 replicate structure needed for mixed-effects modelling.
 
@@ -211,7 +211,7 @@ end
 
 > **Summary.** A systematic audit of the fitting pipeline uncovered four implementation faults that together were the
 > primary cause of the poor, biased fits seen in early runs. After correcting them, a re-derivation of the baseline
-> parameters and a formal **profile-likelihood** analysis revealed a deeper, *structural* result:
+> parameters and a formal **profile-likelihood** analysis revealed a deeper, **structural** result:
 > **the maximum sodium conductance $\bar{g}_{Na}$ is not identifiable from the action-potential voltage waveform.**
 > This does not defeat the biological aim of the study, but it changes the strategy — the genotype signal must be read
 > from the maximum upstroke velocity $\dot{V}_{max}$, a model-free proxy for peak $I_{Na}$, rather than from a fitted
@@ -224,10 +224,10 @@ Four faults were identified and corrected. Each was verified directly against th
 | # | Problem | Symptom (quantified) | Correction |
 |---|---------|----------------------|-----------|
 | 1 | **RMP contamination** | Rest was estimated as `mean(first 2 ms)`, but the AP foot occurs only ~0.7–1.2 ms into each recording, so the 2 ms window averaged in the upstroke and **over-estimated rest by 16–24 mV** (WT trace 1: −59.7 vs true −78.5; trace 2: −42.6 vs −66.8; trace 3: −49.9 vs −71.6 mV). A ~20 mV baseline error corrupts $V_{init}$, the padded target, the foot threshold, and the scoring baseline. | Robust **pre-foot baseline**: a low-percentile rough rest → foot detection → mean of the genuinely pre-foot samples. Recovers rest to within ~1 mV of the trace start. |
-| 2 | **Stimulus collapse + mis-alignment** | The constant-charge foot objective (ported as a raw SSE) rewarded shrinking the window, so the pulse collapsed to $d\approx0.012$ ms (≈2 samples) with $h\approx1900$–$3900$, and the onset landed **0.04–1.44 ms *before*** the true foot. | Onset **anchored to the empirically detected foot**; only pulse *shape* $(d, dim)$ is fitted, under the original R objective (per-length mean + $h$-weighting). Onset now coincides with the foot ($\Delta = 0.000$ ms on all 30 traces); $d\approx0.06$–$0.29$ ms, $h\approx80$–$375$. |
-| 3 | **No parameter scaling** | Nelder-Mead's ~0.025 absolute simplex step floor dwarfed the smallest parameters (e.g. $N_1\approx0.004$), so they effectively never moved during local refinement. | Optimise in normalised space $x=\theta/|\theta_0|$ (equivalent to R's `optim` `parscale`), so every parameter steps by the same *relative* amount. |
-| 4 | **Under-resolved stimulus** | The adaptive solver, forced to stop only at the pulse *edges*, could step across the flat baseline and under-resolve the brief depolarisation. | Force $\ge 6$ solver stops *across* the pulse (tolerance kept at $10^{-4}$ for speed — the tstops, not a tighter tolerance, resolve the pulse). |
-| 5 | **Spontaneous oscillation ("AP by chance")** | The scored window covered only the AP itself, so the optimiser was free to drive the model into an **intrinsic oscillation**: a *spontaneous* spike landed near the experimental AP while additional spikes fired before and after it, outside the score. The stimulus was not causing the response. | Add a **quiescence term** — score the pre-stimulus and post-AP windows against rest, penalising any non-rest behaviour. The model now fires a single stimulus-driven AP and returns to a stable resting state. |
+| 2 | **Stimulus collapse + mis-alignment** | The constant-charge foot objective (ported as a raw SSE) rewarded shrinking the window, so the pulse collapsed to $d\approx0.012$ ms (≈2 samples) with $h\approx1900$–$3900$, and the onset landed **0.04–1.44 ms before** the true foot. | Onset **anchored to the empirically detected foot**; only pulse **shape** $(d, dim)$ is fitted, under the original R objective (per-length mean + $h$-weighting). Onset now coincides with the foot ($\Delta = 0.000$ ms on all 30 traces); $d\approx0.06$–$0.29$ ms, $h\approx80$–$375$. |
+| 3 | **No parameter scaling** | Nelder-Mead's ~0.025 absolute simplex step floor dwarfed the smallest parameters (e.g. $N_1\approx0.004$), so they effectively never moved during local refinement. | Optimise in normalised space $x=\theta/|\theta_0|$ (equivalent to R's `optim` `parscale`), so every parameter steps by the same **relative** amount. |
+| 4 | **Under-resolved stimulus** | The adaptive solver, forced to stop only at the pulse **edges**, could step across the flat baseline and under-resolve the brief depolarisation. | Force $\ge 6$ solver stops *across* the pulse (tolerance kept at $10^{-4}$ for speed — the tstops, not a tighter tolerance, resolve the pulse). |
+| 5 | **Spontaneous oscillation ("AP by chance")** | The scored window covered only the AP itself, so the optimiser was free to drive the model into an **intrinsic oscillation**: a **spontaneous** spike landed near the experimental AP while additional spikes fired before and after it, outside the score. The stimulus was not causing the response. | Add a **quiescence term** — score the pre-stimulus and post-AP windows against rest, penalising any non-rest behaviour. The model now fires a single stimulus-driven AP and returns to a stable resting state. |
 
 The combined effect was large: corrected resting potentials, foot-aligned stimuli, and a dramatic improvement in achievable
 fit quality (the average-WT fit below is near-perfect where earlier fits were not).
@@ -244,7 +244,7 @@ pipeline. Two runs that differed only in global-search budget produced **excelle
 | 40 000 evals  | 125 | 76  | 1889 | excellent |
 | 120 000 evals | **21** | **184** | **665** | **better** |
 
-A *more thorough* search produced a **6× smaller** $\bar{g}_{Na}$ that fit *better*. A parameter whose best-fit value depends
+A **more thorough** search produced a **6× smaller** $\bar{g}_{Na}$ that fit *better*. A parameter whose best-fit value depends
 this strongly on search effort is the hallmark of non-identifiability, which the profile likelihood below confirms formally.
 
 ```julia; echo=false
@@ -284,11 +284,11 @@ $\bar{g}_K$ — the two conductances trade off freely to produce the same wavefo
 
 The non-identifiability is **structural, not numerical**. The muscle AP is a regenerative, near-all-or-none event: once
 threshold is crossed, the spike overshoots toward $E_{Na}\approx +70$ mV almost independently of the exact $\bar{g}_{Na}$,
-so the *voltage waveform* carries very little information about the absolute sodium conductance. What $\bar{g}_{Na}$ controls
+so the **voltage waveform** carries very little information about the absolute sodium conductance. What $\bar{g}_{Na}$ controls
 is the **rate** of the upstroke — and that information is nearly invisible to a sum-of-squares objective on voltage. With
 $\bar{g}_K$ and the gating kinetics free to compensate, a continuum of $(\bar{g}_{Na},\,\bar{g}_K,\,\text{kinetics})$
-combinations reproduces any given trace. (Notably, the original R analysis partly avoided this through a *coordinate-descent
-split* that fitted the Na parameters against the upstroke window and the K parameters against repolarisation separately —
+combinations reproduces any given trace. (Notably, the original R analysis partly avoided this through a **coordinate-descent**
+split that fitted the Na parameters against the upstroke window and the K parameters against repolarisation separately —
 isolating $\bar{g}_{Na}$'s effect to the phase it actually controls. The single joint fit in the Julia port removed that
 safeguard.)
 
@@ -381,7 +381,7 @@ if sim_data !== nothing
 
     for gname in group_names_report
         row = filter(r -> r.group == gname, avg)
-        if !isempty(row)
+        if nrow(row) > 0
             full_p = merge(par_0, NamedTuple(row[1, :]))
             fig    = ActionPotentialPlots.plot_subunit_kinetics(full_p, "$gname Average")
             savefig(fig, joinpath(images_dir, "kinetics_$(gname).png"))
@@ -400,7 +400,7 @@ if sim_data !== nothing
 
     for gname in group_names_report
         row = filter(r -> r.group == gname, avg)
-        if !isempty(row)
+        if nrow(row) > 0
             full_p = merge(par_0, NamedTuple(row[1, :]))
             fig    = ActionPotentialPlots.plot_alpha_beta(full_p, gname)
             savefig(fig, joinpath(images_dir, "alpha_beta_$(gname).png"))
@@ -428,7 +428,7 @@ if sim_data !== nothing
     for gname in group_names_report
         row = filter(r -> r.group == gname, avg)
         fpath = joinpath(data_folder, "$(species)_$(gname).csv")
-        if !isempty(row) && isfile(fpath)
+        if nrow(row) > 0 && isfile(fpath)
             full_p = merge(par_0, NamedTuple(row[1, :]))
             df_raw = CSV.read(fpath, DataFrame; header=4)
             trace  = collect(skipmissing(df_raw[:, 2]))
@@ -526,7 +526,7 @@ if !isempty(feat_dfs)
         display(Markdown.MD(Markdown.parse("## Feature Summary (mean ± SD by group)\n")))
         for gname in group_names_report
             gdf = filter(r -> r.group == gname, all_feats)
-            if !isempty(gdf)
+            if nrow(gdf) > 0
                 display(Markdown.MD(Markdown.parse("### $gname\n")))
                 rows = []
                 for fc in feat_cols
@@ -643,7 +643,7 @@ if isfile(wt_path) && sim_data !== nothing
     avg = combine(groupby(sim_data, :group), names(sim_data, Real) .=> mean)
     rename!(avg, Dict(old => Symbol(replace(String(old), "_mean" => "")) for old in names(avg)))
     wt_row  = filter(r -> r.group == "WT", avg)
-    wt_p    = !isempty(wt_row) ? merge(par_0, NamedTuple(wt_row[1, :])) : par_0
+    wt_p    = nrow(wt_row) > 0 ? merge(par_0, NamedTuple(wt_row[1, :])) : par_0
 
     ap_pl = ActionPotentialModel.ActionPotential(wt_p, trace_1, time_1, name="WT Profile")
     ActionPotentialModel.find_foot!(ap_pl)

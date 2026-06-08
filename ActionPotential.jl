@@ -6,6 +6,7 @@ using DifferentialEquations, Optim, Plots, Printf, Statistics
 using Sobol, DataFrames, CSV, Distributed
 using QuadGK, StaticArrays, BlackBoxOptim
 using CUDA, DiffEqGPU
+using Logging   # to silence solver dt_min_unstable warnings during fitting
 # successful_retcode is reexported by DifferentialEquations (defined in SciMLBase).
 # Use it instead of `retcode == :Success`: retcode is now a ReturnCode.T enum,
 # so comparing it to the Symbol :Success is ALWAYS false (silently breaks solves).
@@ -121,9 +122,18 @@ function _simulate_trace(params::NamedTuple, time_points::Vector{Float64}, dt::F
     # reltol/abstol 1e-4: tightening to 1e-5 multiplied every solve's cost (and
     # there are tens of thousands of solves per fit), with no visible change to
     # the AP shape. The forced stimulus tstops already guard the brief pulse.
-    sol = solve(prob, Rosenbrock23(),
-                saveat = dt, reltol = 1e-4, abstol = 1e-4,
-                tstops = stim_stops)
+    # dtmin/maxiters: unstable parameter sets (which the optimiser probes
+    # constantly) otherwise make the adaptive solver shrink dt toward machine
+    # epsilon — dozens of rejected stiff steps — before giving up. Capping dtmin
+    # makes such solves abort almost immediately (returning a failure retcode,
+    # handled below as Inf), which is a large speed-up for the fitting loops and
+    # also stops the dt-epsilon shrink before the warning-spam threshold.
+    sol = with_logger(NullLogger()) do
+        solve(prob, Rosenbrock23(),
+              saveat = dt, reltol = 1e-4, abstol = 1e-4,
+              tstops = stim_stops, dtmin = 1e-6, maxiters = 50_000,
+              force_dtmin = false)
+    end
 
     if !successful_retcode(sol) || length(sol.u) != length(time_points)
         return fill(Inf, length(time_points))
@@ -283,7 +293,7 @@ function get_full_trace_details(ap::ActionPotential)
     tspan = (ap.time_points[1], ap.time_points[end])
     prob  = ODEProblem(hodgkin_huxley, u0, tspan, p)
     sol   = solve(prob, Rosenbrock23(), saveat=ap.dt,
-                  tstops=[p.tot_wait, p.tot_wait + p.stim_d])
+                  tstops=[p.tot_wait, p.tot_wait + p.stim_d], verbose=false)
 
     V  = [u[1] for u in sol.u]
     n  = [u[2] for u in sol.u]
@@ -540,7 +550,8 @@ end
 # Local refinement (NelderMead + optional bounds penalty)
 # ---------------------------------------------------------------------------
 function optimize_model(ap::ActionPotential, opt_param_names::Tuple;
-                         bounds::Union{NamedTuple,Nothing} = nothing)
+                         bounds::Union{NamedTuple,Nothing} = nothing,
+                         ref::Union{NamedTuple,Nothing} = nothing)
     println("Starting local refinement (NelderMead)...")
     initial_params = ap.params
     static_data = (
@@ -571,6 +582,9 @@ function optimize_model(ap::ActionPotential, opt_param_names::Tuple;
                                   static_data.stabil_time, static_data.trace_data_len)
         if !isnothing(bounds)
             score += _bounds_penalty(p_vec, opt_param_names, bounds)
+        end
+        if !isnothing(ref)
+            score += _ref_penalty(p_vec, opt_param_names, ref)
         end
         return score
     end
@@ -606,9 +620,25 @@ function _windowed_sse(simVs::Vector{Float64}, exp_padded::Vector{Float64}, mask
     return isfinite(s) ? s : Inf
 end
 
+# Soft penalty keeping each parameter within [lo, hi]× of a reference (par_0)
+# value — R's optimize_split `check_penalty`. Without it the coordinate descent
+# runs parameters to the bounds into degenerate, non-firing regimes (high g_Na
+# cancelled by an inactivated h-gate, g_K pinned at its ceiling, etc.).
+function _ref_penalty(p_vec, free::Tuple, ref::NamedTuple; lo=0.2, hi=3.0)
+    pen = 0.0
+    @inbounds for (k, v) in zip(free, p_vec)
+        r = ref[k]
+        r == 0.0 && continue
+        ratio = v / r                       # same-sign params ⇒ ratio > 0
+        ratio < lo && (pen += 1e6 * (lo - ratio)^2)
+        ratio > hi && (pen += 1e6 * (ratio - hi)^2)
+    end
+    return pen
+end
+
 function optimize_split!(ap::ActionPotential;
                          bounds::Union{NamedTuple,Nothing} = nothing,
-                         n_cycles::Int = 8,
+                         n_cycles::Int = 6,
                          opt_Na = (:M_1, :M_2, :M_6, :M_7, :H_1, :H_3, :H_4, :H_5, :H_6, :g_Na),
                          opt_K  = (:N_1, :N_2, :N_6, :N_7, :g_K))
     println("Coordinate-descent split optimisation ($n_cycles cycles)...")
@@ -619,6 +649,7 @@ function optimize_split!(ap::ActionPotential;
     peak_dur  = 2.0
     exp_pad   = ap.AP_val
     static    = (stim_d=ap.stim_d, stim_h=ap.stim_h, stim_dim=ap.stim_dim, tot_wait=tw)
+    ref       = ap.params                          # par_0 anchor for check_penalty
 
     # Na dominates the upstroke + peak; K dominates the pre-stimulus baseline and
     # the repolarisation tail (which also enforces return to a quiescent rest).
@@ -634,12 +665,12 @@ function optimize_split!(ap::ActionPotential;
             ip = merge(cur, static, (; zip(free, p)...))
             sv = _simulate_trace(ip, tp, dt)
             isinf(sv[1]) && return Inf
-            s  = _windowed_sse(sv, exp_pad, mask)
+            s  = _windowed_sse(sv, exp_pad, mask) + _ref_penalty(p, free, ref)
             isnothing(bounds) || (s += _bounds_penalty(p, free, bounds))
             return s
         end
         r = optimize(obj, init ./ scale, NelderMead(),
-                     Optim.Options(iterations=1500, f_reltol=1e-8))
+                     Optim.Options(iterations=1000, f_reltol=1e-8))
         return merge(cur, (; zip(free, Optim.minimizer(r) .* scale)...))
     end
 
@@ -651,11 +682,28 @@ function optimize_split!(ap::ActionPotential;
     end
     update_model!(ap, p)
 
-    # Final joint refinement on the full quiescence-aware objective.
-    final = optimize_model(ap, Tuple(vcat(collect(opt_Na), collect(opt_K))); bounds=bounds)
-    update_model!(ap, final["par"])
-    return Dict("par" => final["par"], "value" => final["value"],
-                "convergence" => final["convergence"])
+    # Final joint refinement on the FULL quiescence-aware objective, still
+    # anchored to par_0 so the fit cannot drift into a degenerate optimum.
+    all_free = Tuple(vcat(collect(opt_Na), collect(opt_K)))
+    init  = [p[k] for k in all_free]
+    scale = [v == 0 ? 1.0 : abs(v) for v in init]
+    sd = (time_points=tp, dt=dt, experimental_trace=exp_pad,
+          stim_d=ap.stim_d, stim_h=ap.stim_h, stim_dim=ap.stim_dim, tot_wait=tw,
+          stabil_time=ap.stabil_time, trace_data_len=length(ap.trace_data))
+    function fobj(x)
+        pv = x .* scale
+        ip = merge(p, sd, (; zip(all_free, pv)...))
+        s  = _calculate_score(ip, tp, dt, exp_pad, ap.stabil_time, length(ap.trace_data)) +
+             _ref_penalty(pv, all_free, ref)
+        isnothing(bounds) || (s += _bounds_penalty(pv, all_free, bounds))
+        return s
+    end
+    fr = optimize(fobj, init ./ scale, NelderMead(),
+                  Optim.Options(iterations=3000, f_reltol=1e-9))
+    final_p = merge(p, (; zip(all_free, Optim.minimizer(fr) .* scale)...))
+    update_model!(ap, final_p)
+    return Dict("par" => final_p, "value" => Optim.minimum(fr),
+                "convergence" => Optim.converged(fr))
 end
 
 # ---------------------------------------------------------------------------
@@ -831,7 +879,7 @@ function gpu_grid_search!(ap::ActionPotential, opt_param_names::Tuple;
 
     sol = solve(ensemble_prob, GPUTsit5(),
                 DiffEqGPU.EnsembleGPUKernel(CUDABackend());
-                trajectories=num_trajectories, batch_size=batch_size, saveat=dt)
+                trajectories=num_trajectories, batch_size=batch_size, saveat=dt, verbose=false)
 
     best_idx    = best_idx_ref[]
     best_score  = best_score_ref[]
