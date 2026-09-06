@@ -73,8 +73,13 @@ $$\alpha_n(V) = N_1 \cdot \text{softplus}(V - N_2), \qquad \beta_n(V) = \exp\!\l
 where $\text{softplus}(x) = \ln(1+e^x)$ is a smooth approximation to $\max(0,x)$ that prevents derivative discontinuities
 at the gating threshold and ensures numerical stability of the ODE solver [5].
 
-The default h-gate parameters ($H_1 = 0.07$, $H_3 = -20$, $H_4 = 35$, $H_5 = -10$, $H_6 = 65$) are calibrated to reproduce
-standard Hodgkin-Huxley kinetics in absolute voltage: $h_\infty(-70\,\text{mV}) \approx 0.76$ and $\tau_h(-70\,\text{mV}) \approx 9$ ms.
+The default h-gate parameters ($H_1 = 1.0$, $H_3 = -21.1$, $H_4 = 68.3$, $H_5 = -3.67$, $H_6 = 161.5$) use the
+**snake-muscle values from the original R analysis**, giving $h_\infty(-70\,\text{mV}) \approx 0.03$ — Na$^+$ channels
+almost fully **inactivated** at rest. This is a deliberate departure from the textbook squid-axon calibration
+($h_\infty(-70) \approx 0.76$, most channels available): with the textbook value the membrane is a hair-trigger that
+re-fires or oscillates spontaneously, producing spurious extra spikes and unfittable traces (this is the mechanism
+behind fault 5 in *Critical Findings*). With Na$^+$ mostly inactivated at rest, the model instead sits at a stable
+resting state and fires a single stimulus-driven AP, matching the experimental recordings.
 
 ### Stimulus
 
@@ -121,9 +126,15 @@ AP and the membrane to return to a stable resting state. The five-fold weighting
 accurate reproduction of AP amplitude and timing, which are the features most sensitive to $\bar{g}_{Na}$ and the kinetic
 parameters.
 
-The ODE system is solved with the Rosenbrock23 stiff solver (relative and absolute tolerances $10^{-5}$) using forced
+The ODE system is solved with the Rosenbrock23 stiff solver (relative and absolute tolerances $10^{-4}$ — tightening to
+$10^{-5}$ multiplies every solve's cost with no visible change to AP shape, since the forced tstops below already
+resolve the pulse) using forced
 time stops distributed *across* the stimulus pulse (not only at its onset and offset), so the brief depolarisation is
-fully resolved and never stepped over by the adaptive solver.
+fully resolved and never stepped over by the adaptive solver. The GPU ensemble path (below) enforces the same
+guarantee via a `dtmax` bound rather than `tstops`: passing `tstops` to the GPU kernel was tested directly and found
+to hang indefinitely on a fraction of the wide (±90%) Sobol-sampled parameter draws used by the grid search (some of
+which are numerically stiff/non-firing) — a `dtmax` cap gives the same "never step over the pulse" guarantee without
+that failure mode. See the comment above `stim_dtmax` in `gpu_grid_search!` for how this was diagnosed.
 
 ## Group Analysis
 
@@ -135,11 +146,19 @@ replicate structure needed for mixed-effects modelling.
 
 **Statistical model** — for each parameter $\theta$, a linear mixed-effects model is fitted:
 
-$$\theta_{tij} = \mu + \gamma_i + b_{ti} + \epsilon_{tij}$$
+$$\theta_{tgj} = \mu + \gamma_g + b_{tg} + u_j + \epsilon_{tgj}$$
 
-where $\gamma_i$ is the fixed effect of group $i$ (WT, P, EPN), $b_{ti} \sim \mathcal{N}(0, \Sigma)$ is a random slope/intercept
-for table $t$, and $\epsilon_{tij}$ is residual error.  The random table effect accounts for the fact that different starting
-conditions may systematically reach different local optima.
+where $\gamma_g$ is the fixed effect of group $g$ (WT, P, EPN), $b_{tg} \sim \mathcal{N}(0, \Sigma)$ is a random slope/intercept
+for table $t$ (different starting conditions may systematically reach different local optima), $u_j \sim \mathcal{N}(0,\sigma_u^2)$
+is a random intercept for individual trace $j$, and $\epsilon_{tgj}$ is residual error.
+
+The individual-trace term $u_j$ is essential, not optional: each of the $N$ individual recordings per group is refit from
+all 25 tables, so those 25 fits are **repeated measures of the same underlying trace**, not independent replicates. A model
+with only the table random effect (no $u_j$) treats them as $25N$ independent observations per group when there are really
+only $N$ independent biological samples — inflating the effective sample size and anti-conservatively shrinking the
+standard error on $\gamma_g$, which can manufacture a "significant" group difference that would not survive correcting for
+this pseudoreplication. `tbl` and `indiv_id` are crossed (every table is refit against every individual), so both random
+effects are included together: `@formula(θ ~ 1 + group + (1 + group | tbl) + (1 | indiv_id))`.
 
 ## AP Feature Extraction
 
@@ -166,7 +185,10 @@ The approximate 95% confidence interval is where the profile score exceeds the m
 All analyses were performed in Julia 1.x using DifferentialEquations.jl (ODE solving), BlackBoxOptim.jl (global optimisation),
 Optim.jl (local refinement), MixedModels.jl (statistical models), Sobol.jl (quasi-random sequences), and Plots.jl (visualisation).
 Parallel computation across traces used the built-in Distributed.jl framework.
-GPU-accelerated ensemble simulation is available via DiffEqGPU.jl and CUDA.jl for large-scale parameter searches.
+GPU-accelerated ensemble simulation (`--gpu`) is available via DiffEqGPU.jl and CUDA.jl as an alternative global-search
+strategy (Sobol grid over the physiological bounds, evaluated as one batched ensemble) in place of BlackBoxOptim. On
+this hardware it is **not** faster and is **not** the recommended default — see *Critical Findings* for the measured
+comparison and the bugs found and fixed in the GPU path.
 
 ---
 
@@ -197,6 +219,12 @@ sim_data = if isfile(group_data_path)
     df = CSV.read(group_data_path, DataFrame)
     if !("group" in names(df)) && "group_id" in names(df)
         df.group = [group_names_report[id] for id in df.group_id]
+    end
+    # Backfill indiv_id for All_sim_data.csv files written before this column
+    # existed (see workflow_group_trace.jl) — needed for the (1 | indiv_id)
+    # LMM term in Statistical Modelling, below.
+    if !("indiv_id" in names(df)) && "indiv" in names(df)
+        df.indiv_id = string.(df.group, "_", df.indiv)
     end
     df
 else
@@ -325,6 +353,48 @@ safeguard.)
    *independently* of the waveform — e.g. fixing $\bar{g}_K$ and the gating kinetics from voltage-clamp data or literature,
    or constraining the fit with $\dot{V}_{max}$ — rather than co-fitting all of them to the same trace.
 
+## GPU acceleration: two bugs fixed, but CPU remains faster on this hardware
+
+The `--gpu` global-search path (Sobol grid over the search space, evaluated as one batched GPU ensemble via
+DiffEqGPU.jl/CUDA.jl) was audited end-to-end. Two real bugs were found and fixed:
+
+1. **No stimulus force-check on GPU.** The CPU solver is given forced time-stops distributed across the stimulus pulse
+   (see *Optimisation Strategy*) so an adaptive integrator cannot step over the brief depolarisation. The GPU path had
+   no equivalent — passing the same `tstops` to the GPU kernel was tested directly and found to **hang indefinitely**
+   on a fraction of trajectories (reproduced repeatedly; a `dtmin`/`maxiters` safety net did not help). The GPU path
+   now uses a `dtmax` bound instead, which gives the same "never skip the pulse" guarantee without that failure mode.
+2. **No physiological bounds on GPU.** The CPU global search samples candidate parameters from `par_bounds` when
+   supplied; the GPU grid search ignored `par_bounds` entirely and always sampled ±90% of each parameter's *initial*
+   value, with no absolute floor or ceiling. Combined with the trace's actual (non-default) resting potential, this
+   let the Sobol grid draw numerically pathological combinations (e.g. an $M_6$ close enough to zero that
+   $\beta_m$'s exponential sensitivity to voltage blows up) that the explicit GPU integrator could not resolve in
+   bounded time — this was the actual trigger behind the "hang" above surviving even after the `dtmax` fix, until
+   bounds were applied. The GPU search now samples within `par_bounds`, matching the CPU search's space exactly.
+
+With both fixed, the GPU path no longer hangs and searches the same, physiologically bounded space as the CPU path.
+It was then benchmarked directly against BlackBoxOptim (CPU) on a real trace:
+
+| Budget | CPU (BlackBoxOptim) | GPU (Sobol grid) | CPU best score | GPU best score |
+|---|---|---|---|---|
+| 2,000 evaluations/trajectories  | 9.6 s (209/s)   | 355.5 s (6/s) | 7.997×10⁵ | 1.344×10⁶ |
+| 20,000 evaluations/trajectories | 72.5 s (276/s)  | ≈3,555 s extrapolated (6/s, consistent with the 2,000-point measurement) | **3,427** | not run to completion — expected worse |
+
+**GPU is not faster here — it is roughly 35–50× slower per unit of search budget, and produces worse fits at equal
+budget.** Two compounding reasons, independent of the bugs above: (1) `EnsembleGPUKernel` batches every trajectory
+into one kernel launch that runs in lock-step, so the *slowest* trajectory in the batch — and a bounded-but-stiff HH
+parameter draw can still be very slow for an explicit, non-stiff-optimised method like `GPUTsit5` — sets the wall-time
+for the *entire* batch, whereas the CPU path solves each trajectory independently and cheap failures don't hold up
+the others; (2) a static Sobol grid is a far less sample-efficient search strategy than BlackBoxOptim's adaptive
+differential evolution — CPU's best score improves 233× from 2,000→20,000 evaluations, while grid quality improves
+only at the slow $O(1/\sqrt{n})$ rate of space-filling designs, so GPU would need far more than 10× the trajectories
+to close the *quality* gap on top of already being ~35–50× slower per trajectory. This is a genuine hardware/
+algorithm mismatch (CUDA itself is fully functional and correctly targets this GPU — confirmed via `CUDA.versioninfo()`
+— and the model runs entirely in Float64, which consumer GPUs execute at a fraction of their Float32 throughput), not
+a remaining bug. **Recommendation: use the CPU (default) pipeline; treat `--gpu` as experimental and correctness-
+verified but not a speed win on this hardware.**
+
+> *Reproducibility:* `analysis/gpu_vs_cpu_benchmark.jl` reproduces the timing comparison above.
+
 ### Revised analysis strategy
 
 - **Genotype discrimination** is built on model-free features — chiefly $\dot{V}_{max}$, plus $V_{peak}$, AP amplitude,
@@ -402,9 +472,22 @@ if sim_data !== nothing
         row = filter(r -> r.group == gname, avg)
         if nrow(row) > 0
             full_p = merge(par_0, NamedTuple(row[1, :]))
-            fig    = ActionPotentialPlots.plot_alpha_beta(full_p, gname)
-            savefig(fig, joinpath(images_dir, "alpha_beta_$(gname).png"))
-            display(fig)
+            # plot_alpha_beta has a known, environment-sensitive GR-backend
+            # rendering bug on some Plots.jl/GR versions (a BoundsError deep in
+            # GR's segment-drawing code, seemingly triggered by module load
+            # order rather than the data) — catch it so the report still
+            # compiles cleanly rather than embedding a raw stacktrace.
+            try
+                fig = ActionPotentialPlots.plot_alpha_beta(full_p, gname)
+                savefig(fig, joinpath(images_dir, "alpha_beta_$(gname).png"))
+                display(fig)
+            catch e
+                display(Markdown.MD(Markdown.parse(
+                    "> ⚠ Could not render α/β rate-function plot for `$gname` " *
+                    "(GR backend rendering error: `$(sprint(showerror, e))`). " *
+                    "This is a plotting-backend issue, not a data or model problem — " *
+                    "see the steady-state gating curves above for the same information.")))
+            end
         end
     end
 end
@@ -592,9 +675,10 @@ end
 # Statistical Modelling
 
 A linear mixed-effects model is fitted for each optimised parameter to formally test for group differences,
-controlling for random variation across optimisation-start tables.
+controlling for random variation across optimisation-start tables **and** for the repeated-measures structure of
+refitting each individual trace from all 25 tables (see *Methods → Group Analysis*).
 
-**Model:** $\theta \sim 1 + \text{group} + (1 + \text{group} \mid \text{tbl})$
+**Model:** $\theta \sim 1 + \text{group} + (1 + \text{group} \mid \text{tbl}) + (1 \mid \text{indiv\_id})$
 
 The fixed-effect estimates for P and EPN represent differences from WT.
 Significant fixed effects identify parameters that are systematically altered by the TTX-resistance substitutions.
@@ -604,7 +688,7 @@ if sim_data !== nothing
     for param in opt_par_names
         display(Markdown.MD(Markdown.parse("## Parameter: `$param`\n")))
         try
-            formula = @eval @formula($param ~ 1 + group + (1 + group | tbl))
+            formula = @eval @formula($param ~ 1 + group + (1 + group | tbl) + (1 | indiv_id))
             model   = fit(MixedModel, formula, sim_data)
             io      = IOBuffer()
             show(io, MIME("text/plain"), model)

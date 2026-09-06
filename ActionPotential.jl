@@ -145,20 +145,23 @@ end
 # Scoring functions (pure, no side effects)
 # ---------------------------------------------------------------------------
 
-# Core scoring given an already-computed voltage vector.
-# Separated from _calculate_score so GPU grid search can use the GPU-solved
-# trajectory directly without re-solving on CPU.
-function _score_from_trace(simulated_Vs::Vector{Float64},
-                            tot_wait::Float64,
-                            time_points::Vector{Float64},
-                            dt::Float64,
-                            experimental_trace_padded::Vector{Float64},
-                            stabil_time::Float64,
-                            trace_data_len::Int)
-    isempty(simulated_Vs) && return Inf
-    any(isinf, simulated_Vs) && return Inf
-
-    settle     = 2.0   # ms: ignore the brief initial relaxation from V_init
+# The three scoring-window index masks (quiescence / peak / post-peak) depend
+# only on tot_wait, time_points, dt, stabil_time and trace_data_len — ALL fixed
+# for the whole duration of one optimisation call (tot_wait is set once by
+# find_foot! and is never itself an optimised parameter). Recomputing these
+# BitVectors from scratch inside the objective — as the old _score_from_trace
+# did — allocates 3 fresh length-~1500 arrays on EVERY one of the tens of
+# thousands of CPU evals, or every one of up to 500_000 GPU trajectories in
+# gpu_grid_search!'s host-side output_func. Precomputing them once per
+# optimisation call (see global_optimize/optimize_model/gpu_grid_search!) and
+# reusing them here removes that redundant allocation without changing the
+# score's value at all.
+function _score_masks(tot_wait::Float64, time_points::Vector{Float64}, dt::Float64,
+                       stabil_time::Float64, trace_data_len::Int)
+    settle     = 0.5   # ms: ignore only the very first relaxation step from V_init.
+                       # (Larger values let a spontaneous AP fire in the unscored
+                       #  window before the stimulus — a "2nd spike" the optimiser
+                       #  never sees; 0.5 ms forces rest from the start.)
     pk_dur_est = 5.0
     peak_start = tot_wait
     peak_end   = peak_start + pk_dur_est
@@ -173,13 +176,40 @@ function _score_from_trace(simulated_Vs::Vector{Float64},
                     ((time_points .>  trace_end) .& (time_points .<= time_points[end]))
     idx_peak      = (time_points .>= peak_start) .& (time_points .<= peak_end)
     idx_post_peak = (time_points .>  peak_end)   .& (time_points .<= trace_end)
+    return (idx_quiet = idx_quiet, idx_peak = idx_peak, idx_post_peak = idx_post_peak)
+end
 
+# Core scoring given an already-computed voltage vector and precomputed masks
+# (see _score_masks). Separated from _calculate_score so GPU grid search can
+# use the GPU-solved trajectory directly without re-solving on CPU.
+function _score_from_masks(simulated_Vs::Vector{Float64}, masks::NamedTuple,
+                            experimental_trace_padded::Vector{Float64})
+    isempty(simulated_Vs) && return Inf
+    any(isinf, simulated_Vs) && return Inf
     score_val = (
-        sum((simulated_Vs[idx_quiet]     .- experimental_trace_padded[idx_quiet]).^2)     +
-        5.0 * sum((simulated_Vs[idx_peak] .- experimental_trace_padded[idx_peak]).^2)      +
-        sum((simulated_Vs[idx_post_peak] .- experimental_trace_padded[idx_post_peak]).^2)
+        sum((simulated_Vs[masks.idx_quiet]     .- experimental_trace_padded[masks.idx_quiet]).^2)     +
+        5.0 * sum((simulated_Vs[masks.idx_peak] .- experimental_trace_padded[masks.idx_peak]).^2)      +
+        sum((simulated_Vs[masks.idx_post_peak] .- experimental_trace_padded[masks.idx_post_peak]).^2)
     )
     return isfinite(score_val) ? score_val : Inf
+end
+
+# Convenience wrapper computing masks fresh each call — kept for callers that
+# score only occasionally (analysis scripts) where recomputation cost is
+# irrelevant. Hot optimisation loops should precompute masks once via
+# _score_masks and call _score_from_masks directly (see global_optimize,
+# optimize_model, profile_likelihood_gNa, optimize_split!, gpu_grid_search!).
+function _score_from_trace(simulated_Vs::Vector{Float64},
+                            tot_wait::Float64,
+                            time_points::Vector{Float64},
+                            dt::Float64,
+                            experimental_trace_padded::Vector{Float64},
+                            stabil_time::Float64,
+                            trace_data_len::Int)
+    isempty(simulated_Vs) && return Inf
+    any(isinf, simulated_Vs) && return Inf
+    masks = _score_masks(tot_wait, time_points, dt, stabil_time, trace_data_len)
+    return _score_from_masks(simulated_Vs, masks, experimental_trace_padded)
 end
 
 # Simulate and score in one call (used by CPU optimisers).
@@ -193,6 +223,19 @@ function _calculate_score(params::NamedTuple,
     isinf(simulated_Vs[1]) && return Inf
     return _score_from_trace(simulated_Vs, params.tot_wait, time_points, dt,
                               experimental_trace_padded, stabil_time, trace_data_len)
+end
+
+# Fast path for hot optimisation loops: takes masks precomputed once via
+# _score_masks instead of recomputing them from tot_wait/stabil_time/
+# trace_data_len on every evaluation (see _score_masks for why this is safe).
+function _calculate_score(params::NamedTuple,
+                           time_points::Vector{Float64},
+                           dt::Float64,
+                           experimental_trace_padded::Vector{Float64},
+                           masks::NamedTuple)
+    simulated_Vs = _simulate_trace(params, time_points, dt)
+    isinf(simulated_Vs[1]) && return Inf
+    return _score_from_masks(simulated_Vs, masks, experimental_trace_padded)
 end
 
 # ---------------------------------------------------------------------------
@@ -292,8 +335,13 @@ function get_full_trace_details(ap::ActionPotential)
                    infty_h(ap.V_init, p)]
     tspan = (ap.time_points[1], ap.time_points[end])
     prob  = ODEProblem(hodgkin_huxley, u0, tspan, p)
+    # NOTE: no `verbose=false` here — OrdinaryDiffEq no longer accepts a Bool for
+    # `verbose` (it now takes a DEVerbosity object; passing Bool raises
+    # ArgumentError). This function is called per-group for decomposition plots,
+    # not in a hot loop, so default solver verbosity is harmless; the hot path
+    # (_simulate_trace) already suppresses logging via `with_logger(NullLogger())`.
     sol   = solve(prob, Rosenbrock23(), saveat=ap.dt,
-                  tstops=[p.tot_wait, p.tot_wait + p.stim_d], verbose=false)
+                  tstops=[p.tot_wait, p.tot_wait + p.stim_d])
 
     V  = [u[1] for u in sol.u]
     n  = [u[2] for u in sol.u]
@@ -421,6 +469,12 @@ function profile_likelihood_gNa(ap::ActionPotential, opt_param_names::Tuple;
         stabil_time    = ap.stabil_time,
         trace_data_len = length(ap.trace_data)
     )
+    # tot_wait/stabil_time/trace_data_len are fixed across every evaluation at
+    # every g_Na grid point, so the scoring-window masks (see _score_masks) can
+    # be computed once and shared by all threads instead of rebuilt on every
+    # Nelder-Mead evaluation.
+    masks = _score_masks(static_data.tot_wait, static_data.time_points, static_data.dt,
+                         static_data.stabil_time, static_data.trace_data_len)
 
     # Each g_Na value is an independent optimisation — run in parallel threads.
     profile_scores = Vector{Float64}(undef, n_points)
@@ -430,8 +484,7 @@ function profile_likelihood_gNa(ap::ActionPotential, opt_param_names::Tuple;
         function obj(p_vec)
             iter_p = merge(fixed_p, static_data, (; zip(remaining, p_vec)...))
             score  = _calculate_score(iter_p, static_data.time_points, static_data.dt,
-                                      static_data.experimental_trace,
-                                      static_data.stabil_time, static_data.trace_data_len)
+                                      static_data.experimental_trace, masks)
             if !isnothing(bounds)
                 score += _bounds_penalty(p_vec, remaining, bounds)
             end
@@ -565,6 +618,11 @@ function optimize_model(ap::ActionPotential, opt_param_names::Tuple;
         stabil_time    = ap.stabil_time,
         trace_data_len = length(ap.trace_data)
     )
+    # tot_wait/stabil_time/trace_data_len never change across the ~5000
+    # Nelder-Mead evaluations below, so precompute the scoring masks once
+    # (see _score_masks) instead of rebuilding them on every eval.
+    masks = _score_masks(static_data.tot_wait, static_data.time_points, static_data.dt,
+                         static_data.stabil_time, static_data.trace_data_len)
 
     # Parameter scaling (equivalent to R's optim parscale): optimise in
     # normalised space x = p / |p₀| so every parameter steps by the same
@@ -578,8 +636,7 @@ function optimize_model(ap::ActionPotential, opt_param_names::Tuple;
         p_vec  = x .* scale
         iter_p = merge(initial_params, static_data, (; zip(opt_param_names, p_vec)...))
         score  = _calculate_score(iter_p, static_data.time_points, static_data.dt,
-                                  static_data.experimental_trace,
-                                  static_data.stabil_time, static_data.trace_data_len)
+                                  static_data.experimental_trace, masks)
         if !isnothing(bounds)
             score += _bounds_penalty(p_vec, opt_param_names, bounds)
         end
@@ -690,10 +747,11 @@ function optimize_split!(ap::ActionPotential;
     sd = (time_points=tp, dt=dt, experimental_trace=exp_pad,
           stim_d=ap.stim_d, stim_h=ap.stim_h, stim_dim=ap.stim_dim, tot_wait=tw,
           stabil_time=ap.stabil_time, trace_data_len=length(ap.trace_data))
+    fobj_masks = _score_masks(tw, tp, dt, ap.stabil_time, length(ap.trace_data))
     function fobj(x)
         pv = x .* scale
         ip = merge(p, sd, (; zip(all_free, pv)...))
-        s  = _calculate_score(ip, tp, dt, exp_pad, ap.stabil_time, length(ap.trace_data)) +
+        s  = _calculate_score(ip, tp, dt, exp_pad, fobj_masks) +
              _ref_penalty(pv, all_free, ref)
         isnothing(bounds) || (s += _bounds_penalty(pv, all_free, bounds))
         return s
@@ -725,12 +783,15 @@ function global_optimize(ap::ActionPotential, opt_param_names::Tuple;
         stabil_time    = ap.stabil_time,
         trace_data_len = length(ap.trace_data)
     )
+    # BlackBoxOptim's max_evals evaluations all share the same scoring window
+    # (see _score_masks) — compute it once rather than per evaluation.
+    masks = _score_masks(static_data.tot_wait, static_data.time_points, static_data.dt,
+                         static_data.stabil_time, static_data.trace_data_len)
 
     function objective(p_vec)
         iter_p = merge(initial_params, static_data, (; zip(opt_param_names, p_vec)...))
         return _calculate_score(iter_p, static_data.time_points, static_data.dt,
-                                static_data.experimental_trace,
-                                static_data.stabil_time, static_data.trace_data_len)
+                                static_data.experimental_trace, masks)
     end
 
     # Use physiological bounds when supplied; otherwise ±range% of initial value.
@@ -777,11 +838,12 @@ function optimize!(ap::ActionPotential, opt_param_names::Tuple;
     if use_gpu
         println("GPU mode: running grid search with $num_trajectories trajectories...")
         global_result = gpu_grid_search!(ap, opt_param_names;
-                                          num_trajectories=num_trajectories, range=0.9)
+                                          num_trajectories=num_trajectories, range=0.9,
+                                          bounds=bounds)
     else
-        # 50k (was 500k): the profile likelihood shows the g_Na/g_K/kinetics
+        # 20k (was 500k): the profile likelihood shows the g_Na/g_K/kinetics
         # landscape is degenerate, so extra global-search precision lands in the
-        # same flat valley — a 10× speed-up with no meaningful loss of fit.
+        # same flat valley — a 25× speed-up with no meaningful loss of fit.
         global_result = global_optimize(ap, opt_param_names;
                                          max_evals=max_evals, range=0.9, bounds=bounds)
     end
@@ -798,19 +860,47 @@ end
 # GPU grid search (requires CUDA)
 # ---------------------------------------------------------------------------
 function gpu_grid_search!(ap::ActionPotential, opt_param_names::Tuple;
-                           num_trajectories=10000, range=0.5)
+                           num_trajectories=10000, range=0.5,
+                           bounds::Union{NamedTuple,Nothing} = nothing)
     println("Starting GPU grid search ($num_trajectories trajectories)...")
     initial_params = ap.params
     dt             = ap.dt
     time_points    = ap.time_points
     experimental_trace = ap.AP_val
 
+    # Sample within physiological bounds when supplied — matching
+    # global_optimize's search_range (bounds[name] when available, else
+    # ±range% of the initial value) — NOT unconditional ±range% of initial
+    # value for every parameter.
+    #
+    # This is not just a consistency nit: without it, the GPU search explores
+    # a fundamentally different (and unphysiologically wide) parameter space
+    # than the CPU search always has, and was empirically the trigger for a
+    # reproducible EnsembleGPUKernel HANG (see the stim_dtmax comment below
+    # for the tstops half of this story) — e.g. M_6's default is -17.6, but
+    # ±90% of the *initial value* alone allows -1.76, an order of magnitude
+    # closer to zero than par_bounds.M_6 = (-40, -3) permits; near M_6=0 the
+    # beta_m exponential's sensitivity to V blows up, driving the explicit
+    # GPU integrator into a step count blow-up (or worse) that dtmin/maxiters
+    # did not reliably bound in testing. Bounding the search the same way the
+    # CPU path already does removes those combinations from consideration.
     opt_subset = NamedTuple(k => initial_params[k] for k in opt_param_names)
-    s          = SobolSeq(length(opt_subset))
+    lb = Float64[]; ub = Float64[]
+    for k in opt_param_names
+        val = opt_subset[k]
+        if !isnothing(bounds) && haskey(bounds, k)
+            push!(lb, bounds[k][1]); push!(ub, bounds[k][2])
+        else
+            lo = val > 0 ? val * (1 - range) : val * (1 + range)
+            hi = val > 0 ? val * (1 + range) : val * (1 - range)
+            lo > hi && ((lo, hi) = (hi, lo))
+            push!(lb, lo); push!(ub, hi)
+        end
+    end
+    s          = SobolSeq(lb, ub)
     param_sets = Vector{NamedTuple}(undef, num_trajectories)
     for i in 1:num_trajectories
-        p_factors   = next!(s) .* (2 * range) .+ (1.0 - range)
-        p_vec       = values(opt_subset) .* p_factors
+        p_vec         = next!(s)
         param_sets[i] = (; zip(keys(opt_subset), p_vec)...)
     end
 
@@ -823,6 +913,40 @@ function gpu_grid_search!(ap::ActionPotential, opt_param_names::Tuple;
                       infty_h(ap.V_init, template_p)]
     tspan = (time_points[1], time_points[end])
     prob  = ODEProblem(hodgkin_huxley, u0, tspan, template_p)
+
+    # Same stimulus-timing safeguard as the CPU path (_simulate_trace): every
+    # trajectory shares the SAME tot_wait/stim_d (only opt_param_names vary —
+    # neither is ever one of them), so a single step-size bound across the
+    # pulse applies to the whole ensemble. Without this the adaptive GPU
+    # integrator could take one large step across the brief depolarising pulse
+    # on the flat pre-stimulus baseline and never resolve it.
+    #
+    # IMPORTANT — do NOT pass `tstops` here, only `dtmax`. Empirically (see
+    # analysis/gpu_vs_cpu_benchmark.jl and the audit notes), passing `tstops`
+    # to EnsembleGPUKernel/GPUTsit5 together with the wide (±90%) Sobol
+    # parameter range used by this search HANGS INDEFINITELY on at least one
+    # of ~200+ trajectories — reproduced directly, not a timeout guess: dtmin,
+    # maxiters and force_dtmin below do NOT stop it either. `dtmax` alone (no
+    # tstops) on the identical trajectory set completes reliably. This looks
+    # like a genuine EnsembleGPUKernel/tstops interaction bug with
+    # stiff/unstable trajectories (many Sobol draws at this range produce
+    # non-firing or oscillatory dynamics) rather than anything under our
+    # control — re-test if DiffEqGPU is upgraded.
+    #
+    # dtmax is deliberately set to stim_d itself, NOT stim_d/6 (which is what
+    # the CPU path's tstops density effectively achieves). tstops only forces
+    # fine resolution WITHIN the pulse while leaving the solver free to take
+    # large strides over the other ~29 ms of flat baseline; dtmax has no such
+    # locality — it caps the step size for the WHOLE tspan. With real data
+    # (dt as fine as 0.005 ms), stim_d/6 forces >=6000 steps across the entire
+    # 30 ms simulation for every trajectory (not just the ~0.7 ms pulse) and
+    # was measured to turn a <70 s solve into a 20+ minute one. dtmax=stim_d
+    # still guarantees no single step can skip over the ENTIRE pulse (the
+    # actual failure mode being guarded against) while keeping the global
+    # minimum step count modest (~30/stim_d, a few dozen). This resolves the
+    # pulse coarsely rather than in >=6 sub-steps, but that trade-off is
+    # necessary given tstops is unusable here — see the report.jmd note.
+    stim_dtmax = ap.stim_d
 
     function prob_func(prob, ctx)
         i      = ctx.sim_id
@@ -840,15 +964,23 @@ function gpu_grid_search!(ap::ActionPotential, opt_param_names::Tuple;
     best_score_ref = Ref{Float64}(Inf)
     lk             = ReentrantLock()
 
+    # tot_wait is identical for every trajectory (only opt_param_names vary —
+    # tot_wait is never one of them), so the scoring-window masks (see
+    # _score_masks) can be built once and reused by output_func instead of
+    # rebuilt from scratch for every one of up to num_trajectories calls. This
+    # matters far more here than on the CPU path: output_func runs serially,
+    # under a lock, once per GPU trajectory (up to 500_000+), so the previous
+    # per-call BitVector allocation was a serial bottleneck that ate into (and
+    # could exceed) whatever throughput the GPU integration itself gained.
+    masks = _score_masks(ap.tot_wait, time_points, dt, ap.stabil_time, length(ap.trace_data))
+
     function output_func(sol, ctx)
         i = ctx.sim_id
         if !successful_retcode(sol) || length(sol.u) != length(time_points)
             return (Inf, false)
         end
         simV  = [u[1] for u in sol.u]
-        score = _score_from_trace(simV, sol.prob.p.tot_wait, time_points, dt,
-                                   experimental_trace, ap.stabil_time,
-                                   length(ap.trace_data))
+        score = _score_from_masks(simV, masks, experimental_trace)
         lock(lk) do
             if score < best_score_ref[]
                 best_score_ref[] = score
@@ -877,9 +1009,20 @@ function gpu_grid_search!(ap::ActionPotential, opt_param_names::Tuple;
     @printf("GPU batch size: %d trajectories (free %.2f GiB, %d save points)\n",
             batch_size, free_mem / 2^30, n_save)
 
+    # dtmax only — NOT tstops (see the long comment above stim_dtmax: tstops
+    # reproducibly hangs here). dtmin/maxiters/force_dtmin mirror the CPU
+    # path's safety net so a numerically pathological trajectory (common
+    # among wide Sobol draws) fails fast with a bad retcode — scored as Inf
+    # by output_func below — instead of the solver stalling on it.
+    # NOTE: no `verbose=false` here (see the identical note in
+    # get_full_trace_details) — this happens to still work through DiffEqGPU's
+    # EnsembleGPUKernel dispatch today, but OrdinaryDiffEq's core solve() path
+    # now rejects a Bool `verbose` outright, so dropping it here too avoids
+    # relying on that difference persisting across DiffEqGPU versions.
     sol = solve(ensemble_prob, GPUTsit5(),
                 DiffEqGPU.EnsembleGPUKernel(CUDABackend());
-                trajectories=num_trajectories, batch_size=batch_size, saveat=dt, verbose=false)
+                trajectories=num_trajectories, batch_size=batch_size, saveat=dt,
+                dtmax=stim_dtmax, dtmin=1e-6, maxiters=50_000, force_dtmin=false)
 
     best_idx    = best_idx_ref[]
     best_score  = best_score_ref[]

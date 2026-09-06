@@ -5,11 +5,18 @@
 # ── CPU-only (local, 8 cores) ──────────────────────────────────────────────
 #   julia -t 8 main.jl --workflow traces --cores 8
 #
-# ── GPU-accelerated (local or server) ─────────────────────────────────────
+# ── GPU (experimental — see below) ────────────────────────────────────────
 #   julia -t 8 main.jl --workflow traces --cores 8 --gpu --trajectories 500000
 #
-# ── Large server run (64 cores, 500 K GPU trajectories) ───────────────────
-#   julia -t 64 main.jl --workflow group --cores 64 --gpu --trajectories 500000
+# NOTE ON --gpu: benchmarked directly against the CPU path (see
+# analysis/gpu_vs_cpu_benchmark.jl and report.jmd's "GPU acceleration" finding
+# under Critical Findings) — on this hardware, --gpu is ~35-50x SLOWER per
+# unit of search budget than the default BlackBoxOptim path, and converges to
+# worse fits at equal budget (a static Sobol grid vs. adaptive differential
+# evolution). It is correctness-verified (no longer hangs, correctly bounded
+# to the same physiological parameter ranges as the CPU path) but is not a
+# speed win here — use the CPU (default) pipeline unless you are specifically
+# investigating GPU performance on different hardware.
 #
 # Thread count (-t N) controls @threads parallelism (foot-finding, profile
 # likelihood, etc.).  --cores N controls distributed worker count for pmap
@@ -67,7 +74,9 @@ function parse_commandline()
             arg_type = Int
             default  = 4
         "--gpu"
-            help     = "Replace BlackBoxOptim global search with GPU grid search (requires CUDA)"
+            help     = "Replace BlackBoxOptim global search with GPU grid search (requires CUDA). " *
+                       "Experimental: measured ~35-50x slower than the CPU default on this " *
+                       "hardware — see analysis/gpu_vs_cpu_benchmark.jl / report.jmd."
             action   = :store_true
         "--trajectories"
             help     = "Number of GPU trajectories per trace (default 100_000; use 500_000+ on server GPU)"
@@ -91,6 +100,8 @@ function main()
         println("GPU mode enabled — will use CUDA for global search ($(num_traj) trajectories/trace).")
         println("Julia threads available: $(Threads.nthreads())")
         println("Note: start Julia with -t N to set thread count for @threads parallelism.")
+        println("Note: benchmarked ~35-50x SLOWER than the CPU default on this hardware " *
+                 "(analysis/gpu_vs_cpu_benchmark.jl) — experimental, not recommended for speed.")
     end
 
     if workflow in ["traces", "group"]

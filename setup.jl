@@ -15,6 +15,13 @@
 
 using Pkg
 
+# Activate a project-local environment (Project.toml/Manifest.toml live in the
+# repo root) instead of the global environment. Without this, `Pkg.add` below
+# installs into `~/.julia/environments/v1.X/Project.toml`, which is invisible
+# to git and to anyone else who clones the repo — every workflow file and
+# interactive_sliders.jl assume `--project=.` / `Pkg.activate(@__DIR__)`.
+Pkg.activate(@__DIR__)
+
 # Force serial precompilation unless the caller already chose a value.
 # This is the single most effective guard against precompile segfaults on
 # memory-constrained machines.
@@ -62,6 +69,8 @@ packages = [
     "Images",
     # Cluster support (optional but recommended for server runs)
     "ClusterManagers",
+    # Progress bars (worker_functions.jl, workflow_read_traces.jl, workflow_group_trace.jl)
+    "ProgressMeter",
 ]
 
 # Resolve + install everything in one pass (one resolve is better than many),

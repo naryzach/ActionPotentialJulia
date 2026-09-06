@@ -50,9 +50,11 @@ julia -e 'using Pluto; Pluto.run(notebook="interactive_sliders.jl")'
 ```
 
 Adjust sliders in real time.  The right panel shows steady-state gating curves and time
-constants alongside the simulated AP — watch $h_\infty(\text{RMP})$ to confirm the h-gate
-is properly de-inactivated at rest (~0.7–0.8).  Click **Export Parameters** to save your
-parameter set to `initial_params.json`; the workflows will load it automatically.
+constants alongside the simulated AP — watch $h_\infty(\text{RMP})$: for this preparation it
+should sit *low* (~0.03, mostly **inactivated** at rest — see Model Description below), not
+at the textbook squid-axon value of ~0.7–0.8, which makes the membrane fire spontaneously.
+Click **Export Parameters** to save your parameter set to `initial_params.json`; the workflows
+will load it automatically.
 
 ### 2. Fit individual traces
 
@@ -93,14 +95,16 @@ alpha_h(V) = H_1 · exp((V + H_6) / H_3)     beta_h(V) = 1 / (1 + exp((V + H_4) 
 alpha_n(V) = N_1 · softplus(V − N_2)         beta_n(V) = exp((V + N_7) / N_6)
 ```
 
-Default h-gate parameters are calibrated to physiological HH kinetics:
-- $h_\infty(-70\,\text{mV}) \approx 0.76$ (Na channels ≈ 76% de-inactivated at rest)
-- $\tau_h(-70\,\text{mV}) \approx 9\,\text{ms}$
+Default h-gate parameters use the snake-muscle values from the original R analysis:
+- $h_\infty(-70\,\text{mV}) \approx 0.03$ (Na channels ≈ 97% **inactivated** at rest — deliberately *not* the textbook
+  squid-axon value of ~0.75, which makes the membrane fire spontaneously; see `config.jl` and report.jmd *Critical
+  Findings* for why)
 
 ## Optimisation Pipeline
 
 1. **Foot finding** — constant-charge method fits the AP upstroke foot (stimulus shape) before the main optimisation.
-2. **Global search** — BlackBoxOptim (Differential Evolution, 500 000 evals) within physiological bounds.
+2. **Global search** — BlackBoxOptim (Differential Evolution, 20 000 evals by default; the profile-likelihood analysis
+   showed no benefit from the original 500 000) within physiological bounds.
 3. **Local refinement** — Nelder-Mead with a bounds-penalty term (5 000 iterations).
 4. **Profile likelihood** — `profile_likelihood_gNa()` sweeps $\bar{g}_{Na}$ to confirm identifiability.
 
@@ -134,7 +138,8 @@ using Pkg; Pkg.instantiate()
 ```
 
 Key packages: `DifferentialEquations`, `BlackBoxOptim`, `Optim`, `MixedModels`,
-`Sobol`, `Plots`, `StatsPlots`, `Pluto`, `PlutoUI`, `Weave`, `JSON3`, `CUDA`, `DiffEqGPU`.
+`Sobol`, `Plots`, `StatsPlots`, `Pluto`, `PlutoUI`, `Weave`, `JSON3`, `CUDA`, `DiffEqGPU`,
+`ProgressMeter`. See `setup.jl` for the full list.
 
 ## References
 

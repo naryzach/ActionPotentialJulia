@@ -136,19 +136,27 @@ end
 # ---------------------------------------------------------------------------
 function plot_alpha_beta(params::NamedTuple, group_name::String)
     V_range = -100:1:60
-    pn = plot(V_range, [ActionPotentialModel.alpha_n.(V_range, Ref(params))
-                         ActionPotentialModel.beta_n.(V_range,  Ref(params))],
-              title="n-gate", label=["α_n" "β_n"], lw=2)
-    pm = plot(V_range, [ActionPotentialModel.alpha_m.(V_range, Ref(params))
-                         ActionPotentialModel.beta_m.(V_range,  Ref(params))],
-              title="m-gate", label=["α_m" "β_m"], lw=2)
-    ph = plot(V_range, [ActionPotentialModel.alpha_h.(V_range, Ref(params))
-                         ActionPotentialModel.beta_h.(V_range,  Ref(params))],
-              title="h-gate", label=["α_h" "β_h"], lw=2)
-    return plot(pn, pm, ph, layout=(3,1),
-                xlabel="Voltage (mV)", ylabel="Rate (ms⁻¹)",
-                size=(800, 900), dpi=150,
-                plot_title="α/β Rate Functions — $(group_name)")
+    # Pre-allocate the layout and fill subplots by index (plot!(p[i], ...))
+    # rather than composing three separately-constructed Plot objects via
+    # plot(pn, pm, ph, layout=(3,1)) — the latter triggers a GR backend
+    # BoundsError ("attempt to access 161-element StepRange at index [1:322]")
+    # on this Plots.jl/GR version when called from inside a compiled function
+    # (reproduced consistently; the identical composition pattern with only
+    # 2 subplots, used elsewhere in this file, does not trigger it). This is
+    # the more robust Plots.jl idiom regardless of that specific bug.
+    p = plot(layout=(3,1), size=(800, 900), dpi=150,
+             xlabel="Voltage (mV)", ylabel="Rate (ms⁻¹)",
+             plot_title="α/β Rate Functions — $(group_name)")
+    plot!(p[1], V_range, [ActionPotentialModel.alpha_n.(V_range, Ref(params))
+                           ActionPotentialModel.beta_n.(V_range,  Ref(params))],
+          title="n-gate", label=["α_n" "β_n"], lw=2)
+    plot!(p[2], V_range, [ActionPotentialModel.alpha_m.(V_range, Ref(params))
+                           ActionPotentialModel.beta_m.(V_range,  Ref(params))],
+          title="m-gate", label=["α_m" "β_m"], lw=2)
+    plot!(p[3], V_range, [ActionPotentialModel.alpha_h.(V_range, Ref(params))
+                           ActionPotentialModel.beta_h.(V_range,  Ref(params))],
+          title="h-gate", label=["α_h" "β_h"], lw=2)
+    return p
 end
 
 # ---------------------------------------------------------------------------

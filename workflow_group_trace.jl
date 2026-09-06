@@ -84,6 +84,13 @@ function main_group_trace(; use_gpu::Bool=false, num_trajectories::Int=100_000)
     sim_data    = DataFrame(all_results)
     sim_data.group = [group_names[id] for id in sim_data.group_id]
 
+    # Unique biological-replicate identifier: `indiv` alone repeats across the
+    # three group files (1..N_traces per file), so without qualifying it by
+    # group, individual 1 of WT and individual 1 of EPN would be treated as
+    # the SAME random-effect level. See the (1 | indiv_id) term added to the
+    # LMMs below.
+    sim_data.indiv_id = string.(sim_data.group, "_", sim_data.indiv)
+
     CSV.write(joinpath(latest_dir, "All_sim_data.csv"), sim_data)
     println("Full data saved.")
 
@@ -142,13 +149,27 @@ function main_group_trace(; use_gpu::Bool=false, num_trajectories::Int=100_000)
     # Headline first: maximum upstroke velocity (the g_Na proxy).
     sort!(feat_cols; by = c -> (c === :feat_max_dvdt ? "" : String(c)))
 
+    # Each of the N individuals per group is fit 25 times (once per Sobol
+    # table) from the SAME experimental trace — those 25 fits are repeated
+    # measures of one underlying data point, not 25 independent replicates.
+    # Modelling only a per-table random effect (as before) ignores this
+    # within-individual correlation entirely: every table×individual cell was
+    # treated as an independent observation, giving N_indiv × 25 "samples" per
+    # group when there are really only N_indiv independent biological
+    # replicates. That inflates the effective sample size and anti-
+    # conservatively shrinks standard errors on the group fixed effect — i.e.
+    # it can manufacture significant group differences that would not survive
+    # correcting for pseudoreplication. Adding (1 | indiv_id) absorbs the
+    # per-individual repeated-measures correlation; (1 + group | tbl) is kept
+    # because a given table's randomised nuisance-parameter draw can still
+    # systematically shift every fit sharing that table.
     function fit_one_lmm(fh, resp)
         println("\n--- $resp ---")
         println(fh, "\n" * "="^60)
         println(fh, "Response: $resp")
         println(fh, "="^60)
         try
-            formula = @eval @formula($resp ~ 1 + group + (1 + group | tbl))
+            formula = @eval @formula($resp ~ 1 + group + (1 + group | tbl) + (1 | indiv_id))
             model   = fit(MixedModel, formula, sim_data)
             println(model)
             show(fh, model)
@@ -163,9 +184,13 @@ function main_group_trace(; use_gpu::Bool=false, num_trajectories::Int=100_000)
     open(stats_path, "w") do fh
         println(fh, "Linear Mixed-Effects Model Summary")
         println(fh, "Generated: $(now())\n")
-        println(fh, "Model:          response ~ 1 + group + (1 + group | tbl)")
+        println(fh, "Model:          response ~ 1 + group + (1 + group | tbl) + (1 | indiv_id)")
         println(fh, "Fixed effect:   experimental group (WT, P, EPN)")
-        println(fh, "Random effect:  optimisation table (initial-condition set)\n")
+        println(fh, "Random effects: optimisation table (initial-condition set);")
+        println(fh, "                individual trace (the 25 per-table fits of the SAME")
+        println(fh, "                recording are repeated measures, not independent replicates —")
+        println(fh, "                omitting this term pseudoreplicates and anti-conservatively")
+        println(fh, "                inflates significance of the group effect)\n")
 
         println(fh, "#"^64)
         println(fh, "# PRIMARY — model-free AP features (identifiable observables).")
