@@ -41,7 +41,13 @@ function run_group_fit(task)
                                                       name="T$tbl-G$grp-I$indiv")
         result = ActionPotentialModel.optimize!(ap, opn; bounds=bounds,
                                                 use_gpu=use_gpu, num_trajectories=num_traj)
-        feats  = ActionPotentialModel.extract_ap_features(ap)
+        # use_experimental=true: feat_* must come from the REAL recording (ap.AP_val),
+        # not the fitted simulated trace (ap.Vs) -- see analysis/model_free_features_real_traces.jl.
+        # ap.Vs depends on this fit's Sobol-randomised nuisance-parameter draw, so without
+        # this flag feat_* would vary table-to-table for the SAME real individual, which
+        # contradicts the "model-free, measured directly from the trace" premise these
+        # features are used for (report.jmd, Statistical Modelling).
+        feats  = ActionPotentialModel.extract_ap_features(ap; use_experimental=true)
 
         res = Dict{Symbol, Any}(pairs(result["par"]))
         res[:tbl]      = tbl

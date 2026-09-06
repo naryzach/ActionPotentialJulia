@@ -173,6 +173,24 @@ Model-independent features are extracted directly from the voltage trace to comp
 | AP duration (50%) | APD50 | Width at half-amplitude; sensitive to $\bar{g}_K$ and $\bar{g}_{Na}$ |
 | Afterhyperpolarisation | AHP | Minimum post-spike voltage relative to RMP; reflects $I_K$ tail |
 
+### Time alignment and stimulus standardisation
+
+The raw recordings are a **loose crop**: how much pre-AP baseline a given file happens to contain is an artefact of how
+the data were saved, not biology — there is no reason two traces' upstrokes should occur at the same absolute time from
+the start of the file. All timing features (`t_peak_ms`, `t_threshold_ms`, and APD50's window) are therefore computed
+**relative to that trace's own fitted foot onset** ($t_0$, i.e. `ap.tot_wait` from `find_foot!` — see *Stimulus*, above),
+never relative to the raw recording clock: `extract_ap_features` slices the trace starting at `tot_wait` and measures
+every time as an offset from that point (`t_seg[idx] - t_seg[1]`). This is fit **per trace**, directly against that
+trace's own experimental data, so an arbitrarily-cropped baseline cannot bias a timing comparison across traces or
+genotypes.
+
+Separately, the fitted synthetic stimulus is also **standardised in the one sense that matters for comparability**: its
+total injected charge $Q = h \cdot d / (dim+1)$ is held at the **same fixed value for every trace** (derived once from
+the model's default stimulus parameters, never re-derived per trace) while `find_foot!` only adapts the onset $t_0$,
+duration $d$, and shape $dim$ to match each trace's own upstroke — so differences in fitted stimulus shape reflect how
+each trace's real upstroke actually looks, not a varying amount of injected charge. Every trace receives the same
+"push"; only *when* and *how the model spreads it out* are fit per trace.
+
 ## Parameter Identifiability: Profile Likelihood for $\bar{g}_{Na}$
 
 To test whether $\bar{g}_{Na}$ is identifiable from the AP trace, a **profile likelihood** is computed:
@@ -405,22 +423,96 @@ is extremely sensitive to *which* parameters are fixed, not just *that* some are
 - The full 8-parameter set pushes the optimum to the **edge of the tested grid** (10 mS/cm², the lower bound) rather than
   settling at an interior point — the classic "runs to a boundary" signature of an under-constrained fit.
 
-**Interpretation:** each fixed subset *is* locally identifiable — there is a definite answer *given that subset's
-assumptions*. But across five reasonable, defensible subset choices, that answer ranges from 10 to 289 mS/cm² — more than
-**29-fold**. So the practical conclusion is a refinement, not a reversal, of the original finding: fixing more of the
-kinetics does buy identifiability, but the resulting $\bar{g}_{Na}$ estimate is a direct function of *which* values you
-fixed and at what — it is telling you about your assumptions more than about the trace. A biologically-motivated fixed
-subset is only trustworthy to the extent the **fixed values themselves** are independently justified (e.g. from
-voltage-clamp data on this species/preparation), not merely "the default parameterisation."
+**Interpretation (as originally written):** each fixed subset *is* locally identifiable — there is a definite answer
+*given that subset's assumptions*. But across five reasonable, defensible subset choices, that answer ranges from 10 to
+289 mS/cm² — more than **29-fold**. So the practical conclusion looked like a refinement, not a reversal, of the original
+finding: fixing more of the kinetics buys identifiability, but the resulting $\bar{g}_{Na}$ estimate is a direct function
+of *which* values you fixed — telling you about your assumptions more than about the trace.
 
-> **Caveats on this specific test** (worth a more thorough follow-up before relying on it): a single WT trace, a coarse
-> 15-point $\bar{g}_{Na}$ grid, and one particular choice of which parameters to add at each step ($\bar{g}_K$, then
-> $M_2$, then $M_1$) — a different order or different partner parameters could tell a different story. A stronger version
-> of this analysis would run it across **all traces** (do different traces agree on a stable $\bar{g}_{Na}$ once $\bar{g}_K$
-> and kinetics are fixed at the *same* literature-derived values?), and use fixed values grounded in independent
-> measurements (voltage-clamp $I_{Na}$/$I_K$ kinetics for this species) rather than the current `par_0` defaults, which
-> are themselves a mix of textbook-HH and snake-muscle-calibrated values (see *Gating Variables*, above) — not a fully
-> independent biological ground truth. *Reproducibility:* `analysis/identifiability_reduced_subsets.jl`.
+> **This table turned out to be over-optimistic — see the correction below.** The caveat originally written here said
+> exactly what was wrong with it: *"a single WT trace, a coarse 15-point grid... a stronger version of this analysis
+> would run it across all traces"* and re-optimise properly. That follow-up was run, and it changes the conclusion.
+
+### Correction: the same test with a genuine global search, across three traces
+
+Each row above was re-optimised with a **single Nelder-Mead run per grid point**, started from `par_0`. Re-examining the
+raw numbers: for the 3- and 4-parameter subsets, the SSE hits an *identical* value (≈5,559,189, the "no AP fired"
+penalty) at every $\bar{g}_{Na}$ above ~90 — the same number repeated across a dozen grid points. That is the signature
+of Nelder-Mead getting stuck in the no-fire basin from one starting point, not evidence the trace forbids high
+$\bar{g}_{Na}$ with the right compensating kinetics — a local method cannot tell those two situations apart.
+
+`analysis/identifiability_reduced_subsets_v2.jl` repeats the test with the **same global search (BlackBoxOptim) the
+real pipeline uses** at every grid point, on **three different traces** (WT, P, EPN — trace #1 of each):
+
+| Trace | Free set | Best $\bar{g}_{Na}$ | Max/min SSE ratio | Note |
+|---|---|---|---|---|
+| WT #1 | $\bar{g}_{Na}, \bar{g}_K$ | 283 | 1.54× | weak |
+| WT #1 | $+\,M_2$ | **10 (grid edge)** | 10.4× | runs to boundary |
+| WT #1 | $+\,M_2, M_1$ | 49 | 3.3× | weak–moderate |
+| P #1 | $\bar{g}_{Na}, \bar{g}_K$ | 205 | 1.78× | weak |
+| P #1 | $+\,M_2$ | **400 (grid edge)** | 9.9× | runs to boundary |
+| P #1 | $+\,M_2, M_1$ | **400 (grid edge)** | 9.7× | runs to boundary |
+| EPN #1 | $\bar{g}_{Na}, \bar{g}_K$ | 49 | 1.30× | very weak |
+| EPN #1 | $+\,M_2$ | 166 | 1.83× | weak |
+| EPN #1 | $+\,M_2, M_1$ | 322 | 3.41× | weak–moderate |
+
+```julia; echo=false
+let f = joinpath("analysis", "identifiability_reduced_subsets_v2.png")
+    if isfile(f)
+        display(plot(load(f), axis=nothing, border=:none, size=(800,450)))
+    else
+        println("Figure analysis/identifiability_reduced_subsets_v2.png not found — run analysis/identifiability_reduced_subsets_v2.jl.")
+    end
+end
+```
+
+Two things go wrong with the original table once the search is done honestly. First, the earlier "well-defined interior
+optimum" for the 3- and 4-parameter subsets was a Nelder-Mead artifact: the true global profile for $+\,M_2$ on WT #1
+does **not** plateau near $\bar{g}_{Na}=38$ — it decreases monotonically all the way to the grid's lower edge (10),
+meaning the real optimum lies *below* the tested range entirely, a classic under-constrained "runs to boundary"
+signature the local search never revealed. Second, and more importantly: **the same subset, applied to different real
+traces, gives wildly different answers.** $\bar{g}_{Na}+\bar{g}_K+M_2$ alone gives a best $\bar{g}_{Na}$ of 10 (WT #1),
+400 (P #1), and 166 (EPN #1) — a 40-fold spread across three traces using the *identical* recipe, before genotype is
+even considered. Combined with every ratio in the table sitting well under 11× (most under 2×) over a 40-fold
+$\bar{g}_{Na}$ sweep, none of these subsets are meaningfully identified once tested properly. **The corrected conclusion
+reverses the original one: fixing a biologically-motivated subset, evaluated honestly, does not rescue $\bar{g}_{Na}$
+identifiability with these particular subsets and starting values.** *Reproducibility:*
+`analysis/identifiability_reduced_subsets_v2.jl` (superseding `identifiability_reduced_subsets.jl`, kept for the record
+above).
+
+### A literature-motivated direct test across all real traces
+
+The subsets tried above fix kinetics at `par_0` — the model's default parameterisation, with no independent claim to be
+correct for any particular genotype. A better-grounded version of the same idea is possible here specifically: according
+to PubMed, [Del Carlo et al., "Coevolution with toxic prey produces functional trade-offs in sodium channels of
+predatory snakes"](https://doi.org/10.1101/2023.12.08.570760) (eLife reviewed preprint
+[94633](https://elifesciences.org/reviewed-preprints/94633)) heterologously expressed the **same WT and EPN Nav1.4
+channels studied in this project** (their "Na$_V$1.4$^{EPN}$" — *Th. atratus*, D1277E/A1281P/D1568N — matches this
+report's "EPN" label exactly) and report, from whole-cell/noise-analysis electrophysiology:
+
+- Voltage-dependence of **activation** ($m$-gate) is statistically **identical** between WT and EPN.
+- Voltage-dependence of **inactivation** ($h$-gate) is likewise **unchanged**.
+- Only current *magnitude* differs: EPN's unitary Na$^+$ conductance is **~29–30% lower** than WT ($p=0.032$).
+
+That is real, allele-specific justification — not just "the default parameterisation" — for holding every gating
+parameter fixed at `par_0` and freeing only $\bar{g}_{Na}$ (and, since $g_K$ is outside the scope of that Na-channel
+study, a $\bar{g}_{Na}+\bar{g}_K$ variant as a check). `analysis/gNa_fixed_kinetics_by_group.jl` refit **all 30 real
+traces** this way (not the 750 Sobol-perturbed group-workflow fits) and compared $\bar{g}_{Na}$ directly across WT/P/EPN.
+If the trace data were informative enough to see it, this should reproduce roughly a 25–35% EPN reduction relative to WT.
+
+| Free set | WT $\bar{g}_{Na}$ (median) | P $\bar{g}_{Na}$ (median) | EPN $\bar{g}_{Na}$ (median) | EPN vs WT |
+|---|---|---|---|---|
+| $\bar{g}_{Na}$ alone | 39.7 | 86.6 | 107.9 | **+372% (mean)** — opposite sign from the −30% prediction |
+| $\bar{g}_{Na}+\bar{g}_K$ | 141.9 | 127.2 | 142.1 | ≈0% — medians converge |
+
+It does not reproduce the prediction. The "alone" mean is dragged by boundary-hitting fits — several EPN traces pin at
+$\bar{g}_{Na}=600$, the upper physiological bound, including EPN trace #1, whose RMP estimate of $-36.8$ mV was already
+flagged elsewhere in this report as a likely data-quality outlier. The medians are cleaner but still show no
+correctly-signed, consistent group effect. **Conclusion: even with literature-grounded (not arbitrary) fixed kinetics,
+this dataset's per-trace noise — RMP heterogeneity, small per-group $N$, at least one clear outlier — swamps the
+expected genotype effect on $\bar{g}_{Na}$**, consistent with the group-level mixed model's own null result for fitted
+$\bar{g}_{Na}$ (see *Statistical Modelling*). This is a real data/power limitation, not a fixable coding gap.
+*Reproducibility:* `analysis/gNa_fixed_kinetics_by_group.jl`.
 
 ### A tool for exploring this by hand
 
@@ -765,6 +857,21 @@ The fixed-effect estimates for P and EPN represent differences from **WT** (the 
 Significant fixed effects identify a response that is systematically altered by the TTX-resistance substitutions —
 but see the caveat below the tables: with this many responses tested, a lone $p<0.05$ is a lead, not a conclusion.
 
+> **Bug found and fixed: `feat_*` was being computed from the fitted *simulated* trace, not the real recording.**
+> `run_group_fit` (`worker_functions.jl`) called `extract_ap_features(ap)` without `use_experimental=true` — so every
+> "model-free" feature below came from `ap.Vs` (the model's own post-fit voltage trace), which changes across the 25
+> Sobol-randomised nuisance-parameter tables for the *same* real individual, rather than from `ap.AP_val` (the actual
+> recording), which cannot. This directly contradicts the premise these features are used for — "identifiable,
+> measured directly from each trace" — and is visible in the model output itself: `feat_max_dvdt`'s `tbl` random
+> effect has non-zero variance and a `tbl`-by-`group` correlation, which is only possible if the response changes
+> across re-fits of a fixed individual. **This means the group comparison originally reported here (four "significant"
+> timing features) was measuring simulation/refit noise convolved with genotype, not a real-data signal.** Fixed in
+> `worker_functions.jl` (now passes `use_experimental=true`, matching the `traces` workflow's `fit_trace`, which never
+> had this bug); `All_sim_data.csv`'s `feat_*` columns were repaired in place via
+> `analysis/patch_sim_data_features.jl` (recomputed once per real individual from the raw recording — these features
+> don't depend on the fitted/nuisance parameters at all, so no re-optimisation was needed). The corrected numbers below
+> reflect the repaired data; the corrected conclusion is in *Headline result*, further down.
+
 ## Model-free AP features (primary)
 
 These are the identifiable, model-free observables (see *Critical Findings*) — **`feat_max_dvdt` is the key
@@ -819,31 +926,46 @@ end
 
 ## Headline result and why it needs a caveat
 
-With the pseudoreplication fix (`(1 | indiv_id)`), the NaN-filtering fix, and **WT correctly set as the reference level**
-(a plain-string `group` column defaults to *alphabetical* factor levels — "EPN" sorts first — which would otherwise
-silently make every coefficient "difference from EPN" instead of "difference from WT"; both bugs were present before
-this analysis and are now fixed), the fresh fit gives a specific, coherent pattern: of the 18 responses tested (9
-features × 2 group contrasts, 9 parameters × 2 group contrasts — 36 fixed-effect $p$-values total), **four are nominally
-significant ($p<0.05$), and all four are timing features, not amplitude or conductance**:
+**This section originally reported four nominally-significant timing features and interpreted them as a lead. That
+result does not survive the feature-source bug fix above and is superseded here.**
 
-- `feat_APD50` (EPN vs WT, $p=0.045$)
-- `feat_t_peak_ms` (EPN vs WT, $p=0.021$)
-- `feat_t_threshold_ms` (P vs WT, $p=0.028$; EPN vs WT, $p=0.046$)
+Once `feat_*` is repaired to come from the real recording (identical across a given individual's 25 table-refits, as it
+must be for a genuine model-free observable), the mixed-effects model above develops a new problem: the `tbl` random
+effect collapses to ~0 variance (correctly — the "repeated measures" are now exact duplicates), which drives the
+model's estimated `Residual` variance to ~0 too, leaving `(1 | indiv_id)` to carry the fixed-effect standard errors.
+That part is legitimate. What is **not** reliable is the Wald $z$-test built on top of it: with only $N=9,11,10$
+individuals per group and visibly heavy-tailed real feature values (e.g. WT `feat_max_dvdt` ranges from 305 to
+1179 mV/ms with one clear high outlier), a normal-approximation $p$-value from a REML variance-component estimate is
+not trustworthy — and indeed, after the fix, **nearly every feature now reports $p<10^{-8}$ for at least one group
+contrast**, which is far more "significance" than a modest, biologically plausible effect should produce and is itself
+a red flag for a broken test, not a stronger finding.
 
-`feat_max_dvdt` — the primary $\bar{g}_{Na}$ proxy motivating this whole analysis — is **not** significant for either
-mutant (P: $p=0.25$; EPN: $p=0.41$), nor is any fitted conductance or kinetic parameter.
+The trustworthy version of this test does not depend on distributional assumptions at all: `analysis/model_free_features_real_traces.jl`
+runs an **exact permutation test** (100,000 group-label shuffles) directly on the 30 real per-trace values — one
+observation per individual, no table pseudoreplication, no normality assumption — for the omnibus 3-group difference
+and for the WT-referenced P and EPN contrasts:
 
-**This is a lead, not a conclusion.** Four nominally-significant results out of 36 tests is only modestly more than the
-~1.8 expected by chance under the null, and none survive a Bonferroni correction ($\alpha/36 \approx 0.0014$) or would be
-expected to survive a milder FDR correction. What makes it worth reporting rather than discarding is that **all four
-hits cluster in the same category** (repolarisation/threshold timing) rather than being scattered across unrelated
-responses — a coincidence is less likely to produce that structure than a real, modest effect would. The specific,
-falsifiable hypothesis this suggests: **the TTX-resistance substitutions may shift the *timing* of repolarisation and
-threshold-crossing (particularly in EPN) rather than upstroke amplitude or peak conductance.** This is a plausible
-mechanism — Nav1.4 kinetics (not just peak conductance) are exactly what the substitutions are expected to alter — but it
-was not the hypothesis originally motivating $\dot{V}_{max}$ as the headline proxy, and needs a pre-registered,
-targeted test (ideally on more traces per group, and correcting explicitly for the 3 timing features rather than all 18
-responses) before being treated as established.
+```julia; echo=false
+let f = joinpath("analysis", "model_free_features_real_traces.csv")
+    if isfile(f)
+        display(CSV.read(f, DataFrame))
+    else
+        println("analysis/model_free_features_real_traces.csv not found — run analysis/model_free_features_real_traces.jl.")
+    end
+end
+```
+
+**Result: 0 of 9 features reach omnibus $p<0.05$, and only 1 of the 18 pairwise contrasts does** (`feat_V_threshold`,
+EPN vs WT, $p=0.036$) — almost exactly the ~0.9 hits expected by chance from 18 independent tests at $\alpha=0.05$, and
+not the same feature category (or even the same feature) the original, bug-affected analysis had flagged. `feat_max_dvdt`
+— the primary $\bar{g}_{Na}$ proxy motivating this whole analysis — shows the *largest* raw difference of any feature
+(EPN −170 mV/ms vs WT, driven by one high WT outlier) but still does not clear the exact test ($p=0.077$).
+
+**Conclusion: once computed and tested correctly, the model-free features do not show a reliable genotype separation
+on this dataset either.** This is the honest result of following through on the "go ahead with the model-free timing
+approach" direction: it does not currently work better than the parameter-fitting approach — both are limited by the
+same thing, real per-trace/per-individual variability (including at least one clear RMP outlier) that is large relative
+to $N=9$–$11$ per group. *Reproducibility:* `analysis/model_free_features_real_traces.jl`.
 
 ---
 
@@ -962,42 +1084,61 @@ produce detectable, parameter-level differences.
    waveform-fitting alone. Obtaining $\bar{g}_{Na}$ in absolute units requires independent constraints on $\bar{g}_K$ and
    the kinetics (e.g. voltage-clamp data), not co-fitting them to the same trace.
 
-2. **The genotype signal is recoverable from $\dot{V}_{max}$**, the maximum upstroke rate — a *model-free* proxy for peak
-   $I_{Na}$ ($C_m\,\dot{V}_{max} \approx \bar{g}_{Na}\,m^3 h\,(E_{Na}-V)$) measured directly from each trace with no
-   identifiability problem — but the discrimination it provides is **partial**. Per-trace analysis shows EPN robustly
-   lowest across smoothing windows, while WT and P overlap heavily and their ordering flips with the derivative smoothing
-   (see *Critical Findings*); the clean monotonic ordering of the group-averaged traces is a smoothing/averaging artifact.
-   We therefore make $\dot{V}_{max}$ (with the other model-free features) the basis of the genotype comparison, but
-   conclude that it separates EPN from {WT, P} rather than resolving all three genotypes, and that a pre-registered
-   $\dot{V}_{max}$ definition with appropriate statistics is required before publication.
+2. **Fixing a subset of kinetics does not rescue $\bar{g}_{Na}$ identifiability either, once tested properly.** A
+   follow-up hypothesis — that a smaller, biologically-motivated free set (rest of the kinetics held fixed) might have a
+   well-defined optimum — looked promising under a single-trace, single-start local re-optimisation, but a corrected
+   version (genuine global search, three different real traces) shows the opposite: the same subset gives a best
+   $\bar{g}_{Na}$ ranging from 10 to 400 mS/cm² depending only on *which trace* it's applied to, and several "best" fits
+   run to the edge of the tested range rather than settling at an interior optimum (see *Does fixing a parameter subset
+   restore identifiability?*). A further test using kinetics fixed at values with real independent justification — the
+   heterologously-expressed WT/EPN Nav1.4 electrophysiology in Del Carlo et al. [6], which reports identical gating
+   kinetics and a ~30% lower EPN conductance — also failed to reproduce that predicted direction or magnitude when
+   applied to all 30 real traces. **Both corrections point the same way: the limiting factor is not which parameters
+   are held fixed, but real per-trace/per-individual noise (see point 4) that is large relative to $\bar{g}_{Na}$'s
+   expected genotype effect at this sample size.**
 
-3. **Mixed-effects model results (fresh fit) point to timing, not amplitude.** Of 36 group-effect tests (see
-   *Statistical Modelling*), the four nominally significant ones ($p<0.05$) are all **timing** features — `feat_APD50`,
-   `feat_t_peak_ms`, and `feat_t_threshold_ms` (EPN, and P for threshold timing) — while $\dot{V}_{max}$, every fitted
-   conductance, and every kinetic parameter show no significant group effect. This does **not** survive correction for
-   multiple comparisons and is a lead rather than an established result, but the clustering in one specific category
-   (repolarisation/threshold timing, all differing for EPN specifically) is more structured than pure chance would
-   predict. If real, it points toward the substitutions affecting Nav1.4 **gating kinetics** rather than peak
-   conductance or peak current — plausible given the mutations sit in the channel's gating machinery, not just its
-   pore — and reframes what a follow-up study should test first.
+3. **The model-free features do not currently separate the genotypes either — a corrected result.** A bug in the group
+   workflow (`run_group_fit` extracted `feat_*` from the fitted *simulated* trace rather than the real recording — see
+   *Statistical Modelling*) had produced an apparent lead (four nominally-significant timing features, all in EPN).
+   Once fixed and tested with an exact, assumption-free permutation test on the real per-trace values (no table
+   pseudoreplication, no normality assumption), **0 of 9 features reach omnibus significance and only 1 of 18 pairwise
+   contrasts does — about the number expected by chance.** `feat_max_dvdt` (the primary $\bar{g}_{Na}$ proxy) shows the
+   largest raw EPN-vs-WT difference of any feature but still does not clear the exact test ($p=0.077$), driven by
+   overlapping distributions and a single high-outlier WT trace rather than a clean genotype split.
 
-4. **Classification potential** — If multiple parameters shift in a consistent, group-specific direction,
-   linear discriminant analysis or support-vector classification on the fitted parameter vector should
-   correctly assign unknown traces to their genotype group.
+4. **The common thread across points 1–3 is per-trace/per-individual variability, not a fixable identifiability trick.**
+   RMP alone ranges from $-36.8$ to $-80.9$ mV across the 30 real traces (one value, EPN #1, is far outside the
+   physiologically expected range and looks like a data-quality outlier rather than biology); with only 9–11
+   individuals per group, that level of nuisance variation is enough to swamp a real but modest genotype effect,
+   however the data are analysed. This reframes the project's central obstacle: it is not primarily about picking a
+   smarter subset of parameters or a cleverer feature, but about **statistical power and per-preparation noise**.
+
+5. **Classification potential remains untested, not disproven.** No individual feature or fitted parameter currently
+   separates the genotypes on its own, but a multivariate classifier (LDA/SVM on the full feature vector) has not yet
+   been tried and could in principle combine several weak, non-significant univariate signals into a usable classifier
+   — this is a distinct question from the univariate tests above and worth trying before concluding classification is
+   not possible.
 
 **Limitations and future directions:**
 
-- **Identifiability is the central limitation.** Freeing more channel parameters does *not* improve characterisation —
-  it worsens the $\bar{g}_{Na}$/$\bar{g}_K$/kinetics degeneracy. Resolving absolute conductances requires independent
-  measurements: voltage-clamp recordings of the isolated $I_{Na}$ and $I_K$ would pin down $\bar{g}_{Na}$ and $\bar{g}_K$
-  directly and convert the AP fit from an under-determined inverse problem into a constrained one.
+- **Sample size and per-trace noise, not identifiability alone, now look like the central limitation.** The
+  identifiability problem is real and structural (point 1), but points 2–4 show that even generous, literature-informed
+  workarounds for it are currently defeated by ordinary recording-to-recording variability at $N=9$–$11$ per group.
+  More traces per genotype — and either excluding or specifically investigating the RMP outlier (EPN #1) — would do
+  more for this project right now than a further search for a smarter fixed-parameter subset.
+- Resolving absolute conductances still requires independent measurements: voltage-clamp recordings of the isolated
+  $I_{Na}$ and $I_K$ **on the same preparations** (not just literature values from a different expression system) would
+  pin down $\bar{g}_{Na}$ and $\bar{g}_K$ directly and convert the AP fit from an under-determined inverse problem into
+  a constrained one — and would let a reduced-subset fit use fixed values matched to the actual recorded cell rather
+  than a population-level literature average.
 - **Coordinate-descent fitting** (as in the original R implementation) — fitting Na parameters against the upstroke window
   and K parameters against repolarisation separately — partially isolates each conductance to the phase it controls and
   should be restored if conductance-unit estimates are pursued; it is a partial, not complete, remedy for the degeneracy.
 - The stimulus parameterisation (constant-charge foot) approximates an unknown injection current.
   If the exact stimulus waveform is recorded, it should be used directly to eliminate this nuisance parameter.
-- A leave-one-out cross-validation study on the **model-free features** ($\dot{V}_{max}$, APD50, AHP, …) would confirm
-  whether they generalise to classify the genotype of held-out traces — the most promising route to the secondary goal.
+- A multivariate classifier (LDA/SVM, point 5) and a leave-one-out cross-validation study on the full **model-free
+  feature vector** would test whether a combination of individually-weak features generalises to classify held-out
+  traces — worth trying before concluding the secondary goal is unreachable with this dataset.
 
 ---
 
@@ -1016,3 +1157,7 @@ produce detectable, parameter-level differences.
 
 [5] Hodgkin AL, Huxley AF (1952). A quantitative description of membrane current and its application to
     conduction and excitation in nerve. *Journal of Physiology* **117**(4): 500–544.
+
+[6] Del Carlo RE, Reimche JS, Moniz HA, Hague MTJ, Agarwal SR, Brodie ED Jr, Brodie ED III, Leblanc N, Feldman CR
+    (2023). Coevolution with toxic prey produces functional trade-offs in sodium channels of predatory snakes.
+    *eLife* reviewed preprint 94633. https://doi.org/10.1101/2023.12.08.570760
