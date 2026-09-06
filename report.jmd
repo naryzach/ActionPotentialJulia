@@ -226,6 +226,11 @@ sim_data = if isfile(group_data_path)
     if !("indiv_id" in names(df)) && "indiv" in names(df)
         df.indiv_id = string.(df.group, "_", df.indiv)
     end
+    # Force WT as the reference level explicitly — a plain String column
+    # defaults to ALPHABETICAL factor levels in @formula's contrasts ("EPN"
+    # sorts first), which would silently make every LMM coefficient below
+    # "difference from EPN" while the write-up says "difference from WT".
+    df.group = categorical(df.group; levels=group_names_report)
     df
 else
     @warn "Group data not found at '$(group_data_path)'. Run the 'group' workflow first."
@@ -352,6 +357,82 @@ safeguard.)
 3. **To obtain $\bar{g}_{Na}$ in conductance units** (if required for the paper), the trade-off partners must be constrained
    *independently* of the waveform — e.g. fixing $\bar{g}_K$ and the gating kinetics from voltage-clamp data or literature,
    or constraining the fit with $\dot{V}_{max}$ — rather than co-fitting all of them to the same trace.
+
+## Does fixing a parameter subset restore identifiability?
+
+The non-identifiability above was established with **all eight** kinetic/conductance parameters free at once — that is a
+claim about *that* free set, not a claim that $\bar{g}_{Na}$ is unmeasurable in principle. A natural follow-up question is
+whether a smaller, **biologically-motivated** free set — the rest of the kinetics held at their calibrated `par_0` values,
+freeing only $\bar{g}_{Na}$ and a deliberately chosen handful of partners — recovers a well-defined optimum.
+
+This was tested directly: profile likelihood for $\bar{g}_{Na}$ (same method as above — fix $\bar{g}_{Na}$ on a grid,
+re-optimise whatever else is free at each point) was repeated for five progressively larger free sets, from $\bar{g}_{Na}$
+completely alone up to the original 8-parameter baseline, on a single real WT trace:
+
+```julia; echo=false
+let f = joinpath("analysis", "identifiability_reduced_subsets.png")
+    if isfile(f)
+        display(plot(load(f), axis=nothing, border=:none, size=(750,420)))
+    else
+        println("Figure analysis/identifiability_reduced_subsets.png not found — run analysis/identifiability_reduced_subsets.jl.")
+    end
+end
+```
+
+| Free parameters | Best SSE | Best $\bar{g}_{Na}$ | SSE range across grid (max/min) |
+|---|---|---|---|
+| $\bar{g}_{Na}$ alone | 5,174,989 | **94** mS/cm² | 3.4× |
+| $\bar{g}_{Na}, \bar{g}_K$ | 3,590,798 | **289** mS/cm² | 1.8× (flattest of all) |
+| $\bar{g}_{Na}, \bar{g}_K, M_2$ | 467,267 | **38** mS/cm² | 11.9× |
+| $\bar{g}_{Na}, \bar{g}_K, M_2, M_1$ | 106,129 | **38** mS/cm² | 52.4× |
+| Full 8-parameter (baseline) | 11,291 | **10** mS/cm² (grid edge) | 492.3× |
+
+**Every row *does* have a well-defined best $\bar{g}_{Na}$** — none of these profiles is the same kind of "flat valley" as
+the full free-space profile above (note this uses a single raw trace with the quiescence-weighted objective, at much finer
+time resolution than the averaged-trace profile above, so absolute SSE values are not directly comparable across the two
+analyses — only the *shape* and *relative* comparisons within this table are). But the results argue against a simple
+"fix biologically-plausible values, read off $\bar{g}_{Na}$" workflow, for a specific reason: **the best-fit $\bar{g}_{Na}$
+is extremely sensitive to *which* parameters are fixed, not just *that* some are fixed:**
+
+- Freeing $\bar{g}_K$ alongside $\bar{g}_{Na}$ (row 2) reproduces the classic trade-off directly: the profile *flattens*
+  (lowest max/min ratio of all five) and the optimum **jumps from 94 to 289 mS/cm²** — a > 3-fold shift from adding a
+  single compensating parameter. This is the clearest, most isolated demonstration in this analysis of the mechanism
+  behind the original non-identifiability finding: $\bar{g}_K$ is the dominant compensator.
+- Adding $M_2$ (row 3) does not simply add more compensation — it unlocks an entirely different, much better-fitting
+  solution branch: SSE drops **7.7×** and the optimum jumps again, to 38 mS/cm². Adding $M_1$ on top (row 4) stays at the
+  same $\bar{g}_{Na}=38$ but improves the fit a further **4.4×** — consistent with $M_1$ refining the *same* branch $M_2$
+  found, rather than introducing new degeneracy.
+- The full 8-parameter set pushes the optimum to the **edge of the tested grid** (10 mS/cm², the lower bound) rather than
+  settling at an interior point — the classic "runs to a boundary" signature of an under-constrained fit.
+
+**Interpretation:** each fixed subset *is* locally identifiable — there is a definite answer *given that subset's
+assumptions*. But across five reasonable, defensible subset choices, that answer ranges from 10 to 289 mS/cm² — more than
+**29-fold**. So the practical conclusion is a refinement, not a reversal, of the original finding: fixing more of the
+kinetics does buy identifiability, but the resulting $\bar{g}_{Na}$ estimate is a direct function of *which* values you
+fixed and at what — it is telling you about your assumptions more than about the trace. A biologically-motivated fixed
+subset is only trustworthy to the extent the **fixed values themselves** are independently justified (e.g. from
+voltage-clamp data on this species/preparation), not merely "the default parameterisation."
+
+> **Caveats on this specific test** (worth a more thorough follow-up before relying on it): a single WT trace, a coarse
+> 15-point $\bar{g}_{Na}$ grid, and one particular choice of which parameters to add at each step ($\bar{g}_K$, then
+> $M_2$, then $M_1$) — a different order or different partner parameters could tell a different story. A stronger version
+> of this analysis would run it across **all traces** (do different traces agree on a stable $\bar{g}_{Na}$ once $\bar{g}_K$
+> and kinetics are fixed at the *same* literature-derived values?), and use fixed values grounded in independent
+> measurements (voltage-clamp $I_{Na}$/$I_K$ kinetics for this species) rather than the current `par_0` defaults, which
+> are themselves a mix of textbook-HH and snake-muscle-calibrated values (see *Gating Variables*, above) — not a fully
+> independent biological ground truth. *Reproducibility:* `analysis/identifiability_reduced_subsets.jl`.
+
+### A tool for exploring this by hand
+
+`interactive_sliders.jl` (open with `julia -e 'using Pluto; Pluto.run(notebook="interactive_sliders.jl")'`) now overlays a
+real experimental trace (choose genotype and trace index) on the simulated AP **and reports the live score using the
+exact objective `optimize!` minimises**, updating in real time as parameters are adjusted. This turns the identifiability
+question above into something explorable by hand: fix a subset of parameters at values you consider biologically
+motivated, tune the remaining few (starting from $\bar{g}_{Na}$ and $\bar{g}_K$) against a specific trace, and use the
+**Export Parameters** button to save the result to `initial_params.json` — which the automated pipeline loads
+automatically as its starting point. This is a direct, complementary way to search for a better-motivated seed than the
+current `par_0`, and to sanity-check whether a hand-tuned "good, biologically plausible" fit exists at a $\bar{g}_{Na}$
+consistent with (or different from) the values in the table above.
 
 ## GPU acceleration: two bugs fixed, but CPU remains faster on this hardware
 
@@ -674,19 +755,55 @@ end
 
 # Statistical Modelling
 
-A linear mixed-effects model is fitted for each optimised parameter to formally test for group differences,
-controlling for random variation across optimisation-start tables **and** for the repeated-measures structure of
-refitting each individual trace from all 25 tables (see *Methods → Group Analysis*).
+A linear mixed-effects model is fitted for each response to formally test for group differences, controlling for
+random variation across optimisation-start tables **and** for the repeated-measures structure of refitting each
+individual trace from all 25 tables (see *Methods → Group Analysis*).
 
 **Model:** $\theta \sim 1 + \text{group} + (1 + \text{group} \mid \text{tbl}) + (1 \mid \text{indiv\_id})$
 
-The fixed-effect estimates for P and EPN represent differences from WT.
-Significant fixed effects identify parameters that are systematically altered by the TTX-resistance substitutions.
+The fixed-effect estimates for P and EPN represent differences from **WT** (the reference level).
+Significant fixed effects identify a response that is systematically altered by the TTX-resistance substitutions —
+but see the caveat below the tables: with this many responses tested, a lone $p<0.05$ is a lead, not a conclusion.
+
+## Model-free AP features (primary)
+
+These are the identifiable, model-free observables (see *Critical Findings*) — **`feat_max_dvdt` is the key
+$\bar{g}_{Na}$ proxy** and is listed first.
+
+```julia; echo=false
+if sim_data !== nothing
+    feat_cols_report = [Symbol(c) for c in names(sim_data) if startswith(String(c), "feat_")]
+    sort!(feat_cols_report; by = c -> (c === :feat_max_dvdt ? "" : String(c)))
+    for feat in feat_cols_report
+        display(Markdown.MD(Markdown.parse("### Feature: `$feat`\n")))
+        try
+            # NaN (not `missing`) responses — e.g. undefined APD50/AHP
+            # crossings — silently propagate through the fit instead of being
+            # dropped; filter to finite rows first.
+            valid = .!ismissing.(sim_data[!, feat]) .& isfinite.(coalesce.(sim_data[!, feat], NaN))
+            formula = @eval @formula($feat ~ 1 + group + (1 + group | tbl) + (1 | indiv_id))
+            model   = fit(MixedModel, formula, sim_data[valid, :])
+            io      = IOBuffer()
+            show(io, MIME("text/plain"), model)
+            display(Markdown.MD(Markdown.parse("```\n$(String(take!(io)))\n```")))
+        catch e
+            display(Markdown.MD(Markdown.parse("> ⚠ Could not fit model for `$feat`: `$e`")))
+        end
+    end
+end
+```
+
+## Fitted HH parameters (secondary)
+
+> ⚠ **$\bar{g}_{Na}$ is non-identifiable from the AP waveform** (flat profile likelihood — see *Critical Findings*).
+> Any group effect on fitted $\bar{g}_{Na}$ below reflects where the optimiser happened to land, not a biological
+> difference, and should not be used for between-group inference. The model-free features above are the
+> trustworthy comparison.
 
 ```julia; echo=false
 if sim_data !== nothing
     for param in opt_par_names
-        display(Markdown.MD(Markdown.parse("## Parameter: `$param`\n")))
+        display(Markdown.MD(Markdown.parse("### Parameter: `$param`\n")))
         try
             formula = @eval @formula($param ~ 1 + group + (1 + group | tbl) + (1 | indiv_id))
             model   = fit(MixedModel, formula, sim_data)
@@ -699,6 +816,34 @@ if sim_data !== nothing
     end
 end
 ```
+
+## Headline result and why it needs a caveat
+
+With the pseudoreplication fix (`(1 | indiv_id)`), the NaN-filtering fix, and **WT correctly set as the reference level**
+(a plain-string `group` column defaults to *alphabetical* factor levels — "EPN" sorts first — which would otherwise
+silently make every coefficient "difference from EPN" instead of "difference from WT"; both bugs were present before
+this analysis and are now fixed), the fresh fit gives a specific, coherent pattern: of the 18 responses tested (9
+features × 2 group contrasts, 9 parameters × 2 group contrasts — 36 fixed-effect $p$-values total), **four are nominally
+significant ($p<0.05$), and all four are timing features, not amplitude or conductance**:
+
+- `feat_APD50` (EPN vs WT, $p=0.045$)
+- `feat_t_peak_ms` (EPN vs WT, $p=0.021$)
+- `feat_t_threshold_ms` (P vs WT, $p=0.028$; EPN vs WT, $p=0.046$)
+
+`feat_max_dvdt` — the primary $\bar{g}_{Na}$ proxy motivating this whole analysis — is **not** significant for either
+mutant (P: $p=0.25$; EPN: $p=0.41$), nor is any fitted conductance or kinetic parameter.
+
+**This is a lead, not a conclusion.** Four nominally-significant results out of 36 tests is only modestly more than the
+~1.8 expected by chance under the null, and none survive a Bonferroni correction ($\alpha/36 \approx 0.0014$) or would be
+expected to survive a milder FDR correction. What makes it worth reporting rather than discarding is that **all four
+hits cluster in the same category** (repolarisation/threshold timing) rather than being scattered across unrelated
+responses — a coincidence is less likely to produce that structure than a real, modest effect would. The specific,
+falsifiable hypothesis this suggests: **the TTX-resistance substitutions may shift the *timing* of repolarisation and
+threshold-crossing (particularly in EPN) rather than upstroke amplitude or peak conductance.** This is a plausible
+mechanism — Nav1.4 kinetics (not just peak conductance) are exactly what the substitutions are expected to alter — but it
+was not the hypothesis originally motivating $\dot{V}_{max}$ as the headline proxy, and needs a pre-registered,
+targeted test (ideally on more traces per group, and correcting explicitly for the 3 timing features rather than all 18
+responses) before being treated as established.
 
 ---
 
@@ -826,10 +971,15 @@ produce detectable, parameter-level differences.
    conclude that it separates EPN from {WT, P} rather than resolving all three genotypes, and that a pre-registered
    $\dot{V}_{max}$ definition with appropriate statistics is required before publication.
 
-3. **Mixed-effects model p-values** — Parameters with significant group effects identify which aspects
-   of Nav1.4 or Kv channel function are altered by the resistance substitutions.
-   Given that EPN carries three substitutions in the Nav1.4 selectivity filter / voltage sensor,
-   significant changes in $\bar{g}_{Na}$, $M_1$, $M_2$, or $H_*$ parameters are biologically predicted.
+3. **Mixed-effects model results (fresh fit) point to timing, not amplitude.** Of 36 group-effect tests (see
+   *Statistical Modelling*), the four nominally significant ones ($p<0.05$) are all **timing** features — `feat_APD50`,
+   `feat_t_peak_ms`, and `feat_t_threshold_ms` (EPN, and P for threshold timing) — while $\dot{V}_{max}$, every fitted
+   conductance, and every kinetic parameter show no significant group effect. This does **not** survive correction for
+   multiple comparisons and is a lead rather than an established result, but the clustering in one specific category
+   (repolarisation/threshold timing, all differing for EPN specifically) is more structured than pure chance would
+   predict. If real, it points toward the substitutions affecting Nav1.4 **gating kinetics** rather than peak
+   conductance or peak current — plausible given the mutations sit in the channel's gating machinery, not just its
+   pore — and reframes what a follow-up study should test first.
 
 4. **Classification potential** — If multiple parameters shift in a consistent, group-specific direction,
    linear discriminant analysis or support-vector classification on the fitted parameter vector should

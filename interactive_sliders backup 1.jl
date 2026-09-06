@@ -1,5 +1,5 @@
 ### A Pluto.jl notebook ###
-# v1.0.3
+# v0.20.17
 
 using Markdown
 using InteractiveUtils
@@ -32,7 +32,7 @@ begin
 	using .ActionPotentialModel
 end
 
-# ╔═╡ a51a30be-a99e-11f1-a15e-4fa8872b7e9b
+# ╔═╡ intro-cell
 md"""
 # Interactive Action Potential Explorer
 
@@ -55,7 +55,7 @@ export it, then point to `initial_params.json` in your message.
 > kinetic parameters while watching the live score.
 """
 
-# ╔═╡ a51a30be-a99e-11f1-ae80-4d3a2aa677d5
+# ╔═╡ trace-select
 @bind trace_choice PlutoUI.combine() do Child
 	md"""
 	#### Reference trace
@@ -64,7 +64,7 @@ export it, then point to `initial_params.json` in your message.
 	"""
 end
 
-# ╔═╡ a51a30be-a99e-11f1-985f-bda76ab67933
+# ╔═╡ trace-load
 begin
 	trace_group, trace_idx = trace_choice
 	local fpath = joinpath(data_folder, "Atratus_$(trace_group).csv")
@@ -208,10 +208,10 @@ begin
 	plot(p_ap, p_inf, p_tau, layout=(1, 3), size=(1400, 400), dpi=120)
 end
 
-# ╔═╡ a51a30be-a99e-11f1-acc4-33c4c80e738b
+# ╔═╡ export-cell
 @bind export_button Button("💾 Export current parameters to initial_params.json")
 
-# ╔═╡ a51a30be-a99e-11f1-8760-e12df87dbf7d
+# ╔═╡ export-action
 begin
 	export_button  # triggers re-run when button is clicked
 
@@ -257,10 +257,10 @@ end
 
 # ╔═╡ Cell order:
 # ╠═f7312cb2-8a05-11f0-2004-890435c0dfe8
-# ╠═a51a30be-a99e-11f1-a15e-4fa8872b7e9b
-# ╠═a51a30be-a99e-11f1-ae80-4d3a2aa677d5
-# ╠═a51a30be-a99e-11f1-985f-bda76ab67933
-# ╠═d94f4e1e-c3b0-4826-a4fe-25b95e6c7370
+# ╟─intro-cell
+# ╟─trace-select
+# ╟─trace-load
+# ╟─d94f4e1e-c3b0-4826-a4fe-25b95e6c7370
 # ╠═51466345-d9d5-4b3e-9cd6-cae3ff3289bc
-# ╠═a51a30be-a99e-11f1-acc4-33c4c80e738b
-# ╠═a51a30be-a99e-11f1-8760-e12df87dbf7d
+# ╟─export-cell
+# ╠═export-action

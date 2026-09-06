@@ -92,6 +92,17 @@ function main_group_trace(; use_gpu::Bool=false, num_trajectories::Int=100_000)
     sim_data.indiv_id = string.(sim_data.group, "_", sim_data.indiv)
 
     CSV.write(joinpath(latest_dir, "All_sim_data.csv"), sim_data)
+
+    # `group` as a plain String column defaults to ALPHABETICAL factor levels
+    # in @formula's contrasts — "EPN" sorts first, so it (not WT) would
+    # silently become the reference level, making every fixed-effect
+    # coefficient below "difference from EPN" while the write-up (and every
+    # reader) expects "difference from wild type". Force WT as the reference
+    # explicitly. This only affects in-memory model fitting here (and in
+    # report.jmd / analysis/regenerate_group_outputs.jl, which apply the same
+    # fix when they re-load the CSV) — CSV.write above already ran and stores
+    # plain strings either way, so this doesn't require re-running the fits.
+    sim_data.group = categorical(sim_data.group; levels=group_names)
     println("Full data saved.")
 
     # --- Summary plots (robust to NaN/missing: some features, e.g. APD50/AHP,
@@ -169,8 +180,20 @@ function main_group_trace(; use_gpu::Bool=false, num_trajectories::Int=100_000)
         println(fh, "Response: $resp")
         println(fh, "="^60)
         try
+            # Some features (APD50, AHP_depth) are NaN/missing when the
+            # relevant voltage crossing isn't found for a given fit. Unlike
+            # `missing`, a NaN Float64 silently propagates through the fit
+            # rather than being dropped, producing an all-NaN model with no
+            # error — filter to finite rows first (same robustness rule the
+            # boxplots already use).
+            valid = .!ismissing.(sim_data[!, resp]) .& isfinite.(coalesce.(sim_data[!, resp], NaN))
+            fit_data = sim_data[valid, :]
+            if nrow(fit_data) < nrow(sim_data)
+                @printf("  (dropped %d/%d rows with non-finite %s)\n",
+                        nrow(sim_data) - nrow(fit_data), nrow(sim_data), resp)
+            end
             formula = @eval @formula($resp ~ 1 + group + (1 + group | tbl) + (1 | indiv_id))
-            model   = fit(MixedModel, formula, sim_data)
+            model   = fit(MixedModel, formula, fit_data)
             println(model)
             show(fh, model)
             println(fh, "\n")
